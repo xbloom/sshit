@@ -4,22 +4,75 @@ use rand_core::OsRng;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::io::Write;
+use log::info;
+
+/// SSH key type enum
+#[derive(Debug, Clone, Copy)]
+pub enum SshKeyType {
+    Ed25519,
+    Rsa,
+}
+
+impl SshKeyType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SshKeyType::Ed25519 => "ed25519",
+            SshKeyType::Rsa => "rsa",
+        }
+    }
+}
 
 /// Manages SSH key generation and storage
 pub struct KeyManager {
     key_path: PathBuf,
+    key_type: SshKeyType,
+    generate_new: bool, // Add flag to control whether to generate new keys
 }
 
 impl KeyManager {
     /// Create a new KeyManager with a path to store the generated key
-    pub fn new(key_path: &Path) -> Result<Self> {
+    pub fn new(key_path: &Path, key_type: SshKeyType, generate_new: bool) -> Result<Self> {
         Ok(Self {
             key_path: key_path.to_path_buf(),
+            key_type,
+            generate_new,
         })
     }
 
-    /// Generate a new Ed25519 keypair and save it to the specified path
-    pub fn generate_keypair(&self) -> Result<Keypair> {
+    /// Generate a new keypair or verify existing one
+    pub fn setup_keypair(&self) -> Result<()> {
+        let private_key_exists = self.key_path.exists();
+        let public_key_exists = self.key_path.with_extension("pub").exists();
+        
+        // If both keys exist and we're not generating new ones, just use the existing ones
+        if private_key_exists && public_key_exists && !self.generate_new {
+            info!("使用已存在的 {} 密钥对，路径：{:?}", self.key_type.as_str(), self.key_path);
+            return Ok(());
+        }
+        
+        // Otherwise generate new keys
+        info!("正在生成新的 {} 密钥对，路径：{:?}", self.key_type.as_str(), self.key_path);
+        
+        match self.key_type {
+            SshKeyType::Ed25519 => self.generate_ed25519_keypair()?,
+            SshKeyType::Rsa => self.generate_rsa_keypair()?,
+        };
+        
+        Ok(())
+    }
+    
+    /// Generate an Ed25519 keypair
+    fn generate_ed25519_keypair(&self) -> Result<()> {
+        // Delete existing key files if they exist
+        if self.key_path.exists() {
+            fs::remove_file(&self.key_path)?;
+        }
+        
+        let pub_path = self.key_path.with_extension("pub");
+        if pub_path.exists() {
+            fs::remove_file(&pub_path)?;
+        }
+        
         // Generate keypair
         let mut csprng = OsRng;
         let keypair = Keypair::generate(&mut csprng);
@@ -57,17 +110,56 @@ impl KeyManager {
             fs::set_permissions(&self.key_path, perms)?;
         }
         
-        Ok(keypair)
+        Ok(())
+    }
+    
+    /// Generate an RSA keypair using external ssh-keygen tool
+    fn generate_rsa_keypair(&self) -> Result<()> {
+        use std::process::Command;
+        
+        // Delete existing key files if they exist
+        if self.key_path.exists() {
+            fs::remove_file(&self.key_path)?;
+        }
+        
+        let pub_path = self.key_path.with_extension("pub");
+        if pub_path.exists() {
+            fs::remove_file(&pub_path)?;
+        }
+        
+        // Use ssh-keygen to generate RSA key (better compatibility)
+        let output = Command::new("ssh-keygen")
+            .arg("-t").arg("rsa")
+            .arg("-b").arg("4096")  // 4096 bit key for better security
+            .arg("-f").arg(&self.key_path)
+            .arg("-C").arg("ssh-proxy-key")
+            .arg("-N").arg("") // Empty passphrase
+            .output()?;
+            
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("Failed to generate RSA key: {}", stderr));
+        }
+        
+        Ok(())
     }
     
     /// Get the public key as a string (for display/configuration)
     pub fn get_public_key_string(&self) -> Result<String> {
         let public_key_path = self.key_path.with_extension("pub");
         if !public_key_path.exists() {
-            return Err(anyhow!("Public key file not found"));
+            return Err(anyhow!("Public key file not found at: {}. Make sure both the private key and public key files exist.", 
+                public_key_path.display()));
         }
         
-        let public_key_string = fs::read_to_string(public_key_path)?;
-        Ok(public_key_string)
+        let public_key_string = fs::read_to_string(&public_key_path)?;
+        Ok(public_key_string.trim().to_string())
+    }
+
+    /// Check if key files exist
+    pub fn key_files_exist(&self) -> bool {
+        let private_key_exists = self.key_path.exists();
+        let public_key_exists = self.key_path.with_extension("pub").exists();
+        private_key_exists && public_key_exists
     }
 } 

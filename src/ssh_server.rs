@@ -20,7 +20,7 @@ impl SshServer {
     /// Connect to the local SSH server
     pub async fn connect(&self) -> Result<TcpStream> {
         let conn_str = format!("{}:{}", self.local_host, self.local_port);
-        info!("Connecting to local SSH server at {}", conn_str);
+        info!("连接到本地 SSH 服务器 {}", conn_str);
         
         let stream = TcpStream::connect(conn_str).await?;
         Ok(stream)
