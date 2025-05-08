@@ -5,8 +5,8 @@ use tokio::net::TcpStream;
 /// SSH server that proxies connections to a local SSH server
 #[derive(Clone)]
 pub struct SshServer {
-    local_host: String,
-    local_port: u16,
+    pub local_host: String,
+    pub local_port: u16,
 }
 
 impl SshServer {
