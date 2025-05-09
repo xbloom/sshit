@@ -1,10 +1,11 @@
 use anyhow::{Result, anyhow};
-use ed25519_dalek::Keypair;
-use rand_core::OsRng;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use rand::rngs::OsRng;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::io::Write;
 use log::info;
+use base64::{engine::general_purpose, Engine};
 
 /// SSH key type enum
 #[derive(Debug, Clone, Copy)]
@@ -74,18 +75,19 @@ impl KeyManager {
         }
         
         // Generate keypair
-        let mut csprng = OsRng;
-        let keypair = Keypair::generate(&mut csprng);
-
+        let mut csprng = OsRng; // 新版 OsRng 不需要调用 new()
+        let signing_key = SigningKey::generate(&mut csprng);
+        let verifying_key = VerifyingKey::from(&signing_key);
+        
         // Save private key in PEM format
         let private_key_path = &self.key_path;
         let mut private_key_file = fs::File::create(private_key_path)?;
         
         // Write private key in PEM format
-        let sec_bytes = keypair.secret.as_bytes();
+        let sec_bytes = signing_key.to_bytes();
         let pem_data = format!(
             "-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
-            base64::encode(&sec_bytes)
+            general_purpose::STANDARD.encode(&sec_bytes)
         );
         private_key_file.write_all(pem_data.as_bytes())?;
         
@@ -94,10 +96,10 @@ impl KeyManager {
         let mut public_key_file = fs::File::create(public_key_path)?;
         
         // Format public key in OpenSSH format
-        let pub_bytes = keypair.public.as_bytes();
+        let pub_bytes = verifying_key.to_bytes();
         let openssh_pubkey = format!(
             "ssh-ed25519 {} ssh-proxy-key",
-            base64::encode(&pub_bytes)
+            general_purpose::STANDARD.encode(&pub_bytes)
         );
         public_key_file.write_all(openssh_pubkey.as_bytes())?;
         public_key_file.write_all(b"\n")?;

@@ -3,17 +3,27 @@ name = "ssh-proxy"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "ssh_proxy"
+path = "src/lib.rs"
+
+[[example]]
+name = "ssh_server_example"
+path = "examples/ssh_server_example.rs"
+
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-ed25519-dalek = "1.0"
-rand = "0.7"
-rand_core = "0.5"
+tokio = { version = "1.35", features = ["full"] }
+ed25519-dalek = "2.1"
+rand = "0.8"
 thiserror = "1.0"
 log = "0.4"
-env_logger = "0.10"
+env_logger = "0.11"
 anyhow = "1.0"
-clap = { version = "4.3", features = ["derive"] }
+clap = { version = "4.4", features = ["derive"] }
 futures = "0.3"
 async-trait = "0.1"
 ssh2 = "0.9"
-base64 = "0.13"
+base64 = "0.21"
+russh = "0.52.0"
+simple_logger = "4.3"
+

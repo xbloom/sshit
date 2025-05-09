@@ -102,15 +102,19 @@ impl SshClient {
         // 获取会话的互斥锁
         let session = session_arc.lock().await;
         
+        // 从 SshServer 获取配置
+        let local_host = &ssh_server.config.listen_addr;
+        let local_port = ssh_server.config.listen_port;
+        
         // 设置远程端口转发 (remote_port 将在远程机器上开放，转发到本地 SSH 服务器)
         info!("正在尝试设置远程端口转发: {}:{} -> {}:{}", 
-              remote_host, remote_port, ssh_server.local_host, ssh_server.local_port);
+              remote_host, remote_port, local_host, local_port);
               
         // 使用正确的 SSH2 API 设置远程转发
-        match session.channel_forward_listen(remote_port, Some(&ssh_server.local_host), None) {
+        match session.channel_forward_listen(remote_port, Some(local_host), None) {
             Ok((mut listener, actual_port)) => {
                 info!("远程端口转发成功设置: {}:{} -> {}:{}, 实际端口: {}", 
-                      remote_host, remote_port, ssh_server.local_host, ssh_server.local_port, actual_port);
+                      remote_host, remote_port, local_host, local_port, actual_port);
                 
                 // 释放锁，以便后续操作可以获取锁
                 drop(session);
@@ -126,6 +130,10 @@ impl SshClient {
                         // 获取阻塞模式的会话 (我们只需要 listener，实际上不需要使用会话)
                         let _session = session_for_accept.blocking_lock();
                         
+                        // 获取本地主机和端口
+                        let local_host = &ssh_server_clone.config.listen_addr;
+                        let local_port = ssh_server_clone.config.listen_port;
+                        
                         // 不断接受连接
                         loop {
                             // 阻塞接受连接
@@ -134,10 +142,11 @@ impl SshClient {
                                     info!("接受到一个转发连接");
                                     
                                     // 为每个连接创建一个新的处理流程
-                                    let ssh_server = ssh_server_clone.clone();
+                                    let local_host = local_host.clone();
+                                    let local_port = local_port;
                                     
                                     // 连接到本地 SSH 服务器
-                                    match TcpStream::connect(format!("{}:{}", ssh_server.local_host, ssh_server.local_port)) {
+                                    match TcpStream::connect(format!("{}:{}", local_host, local_port)) {
                                         Ok(mut local_stream) => {
                                             // 配置通道
                                             channel.handle_extended_data(ssh2::ExtendedData::Merge).unwrap_or_else(|e| {
@@ -218,7 +227,7 @@ impl SshClient {
         });
         
         info!("端口转发已建立: {}:{} -> 本地 SSH 服务器 {}:{}", 
-              remote_host, remote_port, ssh_server.local_host, ssh_server.local_port);
+              remote_host, remote_port, local_host, local_port);
         
         Ok(())
     }

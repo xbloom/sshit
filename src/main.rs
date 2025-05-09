@@ -11,7 +11,7 @@ mod ssh_server;
 
 use key_manager::{KeyManager, SshKeyType};
 use ssh_client::SshClient;
-use ssh_server::SshServer;
+use ssh_server::{SshServer, SshServerConfig};
 
 // Add a custom parser for SshKeyType from string
 impl FromStr for SshKeyType {
@@ -108,13 +108,16 @@ async fn main() -> Result<()> {
     client.connect().await?;
     
     // Choose a random port for the SSH server on the remote machine
-    let remote_proxy_port = rand::thread_rng().gen_range(10000, 65535);
+    let remote_proxy_port = rand::thread_rng().gen_range(10000..65535);
     info!("在远程端口 {} 上启动 SSH 代理", remote_proxy_port);
     
     // Start SSH server
     let ssh_server = SshServer::new(
-        args.local_host,
-        args.local_port,
+        SshServerConfig {
+            listen_addr: args.local_host,
+            listen_port: args.local_port,
+            key_path: None, // 我们会生成一个随机密钥
+        }
     );
     
     // Start port forwarding
