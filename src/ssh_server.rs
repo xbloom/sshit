@@ -34,19 +34,20 @@ struct PtyInfo {
     term: String,
     cols: u32,
     rows: u32,
-    modes: Vec<(Pty, u32)>,
 }
 
 /// 会话信息，包含所有与客户端会话相关的数据
 #[derive(Clone)]
 struct SessionInfo {
     /// 通道ID
+    #[allow(dead_code)]
     channel_id: ChannelId,
     /// 会话句柄
     handle: russh::server::Handle,
     /// PTY信息，如果会话请求了PTY则有值
     pty_info: Option<PtyInfo>,
     /// 会话创建时间
+    #[allow(dead_code)]
     created_at: Instant,
 }
 
@@ -146,17 +147,6 @@ impl SshServer {
         }
     }
 
-    // 新增方法：通过通道ID查找会话
-    async fn get_session_by_channel(&self, channel_id: ChannelId) -> Option<SessionInfo> {
-        let sessions = self.sessions.lock().await;
-        // 遍历所有会话，查找匹配通道ID的会话
-        for session in sessions.values() {
-            if session.channel_id == channel_id {
-                return Some(session.clone());
-            }
-        }
-        None
-    }
 }
 
 impl russh::server::Server for SshServer {
@@ -250,7 +240,7 @@ impl russh::server::Handler for SshServer {
         row_height: u32,
         _pix_width: u32,
         _pix_height: u32,
-        modes: &[(Pty, u32)],
+        _modes: &[(Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         tracing::info!(
@@ -288,7 +278,6 @@ impl russh::server::Handler for SshServer {
             term: term.to_string(),
             cols: col_width,
             rows: row_height,
-            modes: modes.to_vec(),
         };
 
         // 更新会话的PTY信息
@@ -328,7 +317,7 @@ impl russh::server::Handler for SshServer {
         
         // 3. 启动shell - 使用共享的命令处理器
         // 直接await启动shell的结果，而不是异步启动
-        match self.cmd_handler.start_shell_with_pty(
+        match self.cmd_handler.start_shell(
             channel,
             session_info.handle,
             &pty_info.term,

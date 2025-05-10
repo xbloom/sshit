@@ -21,10 +21,7 @@ use std::sync::Mutex as StdMutex;
 pub trait CommandExecutor: Send + Sync {
     /// 执行单个命令
     async fn execute_command(&self, command: &str) -> Result<Child, anyhow::Error>;
-    
-    /// 启动一个Shell
-    async fn start_shell(&self) -> Result<Child, anyhow::Error>;
-    
+        
     /// 启动一个带PTY的Shell
     async fn start_shell_with_pty(&self, term: &str, cols: u32, rows: u32) -> Result<(Arc<StdMutex<Box<dyn MasterPty + Send>>>, Box<dyn PtyChild + Send>), anyhow::Error>;
     
@@ -70,15 +67,6 @@ impl CommandExecutor for DefaultCommandExecutor {
             .map_err(|e| anyhow::anyhow!("无法启动命令: {}", e))
     }
     
-    async fn start_shell(&self) -> Result<Child, anyhow::Error> {
-        Command::new("sh")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("无法启动 shell: {}", e))
-    }
-    
     async fn start_shell_with_pty(&self, term: &str, cols: u32, rows: u32) -> Result<(Arc<StdMutex<Box<dyn MasterPty + Send>>>, Box<dyn PtyChild + Send>), anyhow::Error> {
         // 1. 创建PTY系统和调整大小
         let pty_system = native_pty_system();
@@ -105,7 +93,7 @@ impl CommandExecutor for DefaultCommandExecutor {
         
         // 4. 启动进程
         let child = pair.slave.spawn_command(cmd)
-            .map_err(|e| anyhow::anyhow!("启动Shell进程失败: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("启动Shell - bash进程失败: {}", e))?;
             
         // 5. 将主PTY封装在Arc<Mutex>中，使其可以安全地跨线程共享
         let master = Arc::new(StdMutex::new(pair.master));
@@ -214,6 +202,7 @@ impl Default for CommandHandler {
 
 impl CommandHandler {
     /// 创建一个新的命令处理器实例，使用自定义的执行器
+    #[allow(dead_code)]
     pub fn new(
         command_executor: Arc<dyn CommandExecutor>,
         channel_communicator_factory: Box<dyn Fn(Handle) -> Arc<dyn ChannelCommunicator> + Send + Sync>,
@@ -226,7 +215,7 @@ impl CommandHandler {
     }
     
     /// 启动一个Shell并连接到SSH通道
-    pub async fn start_shell_with_pty(
+    pub async fn start_shell(
         &self,
         channel_id: ChannelId,
         session_handle: Handle,
@@ -517,12 +506,6 @@ impl CommandHandler {
     }
 }
 
-// 为了向后兼容，提供默认构造函数
-impl CommandHandler {
-    pub fn new_default() -> Self {
-        Self::default()
-    }
-}
 
 // 让CommandHandler具有默认实现，方便测试代码迁移
 impl From<()> for CommandHandler {
