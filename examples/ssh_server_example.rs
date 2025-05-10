@@ -1,14 +1,10 @@
-use ssh_proxy::{SshServer, SshServerConfig};
-use simple_logger::SimpleLogger;
-use log::LevelFilter;
+use ssh_proxy::{SshServer, SshServerConfig, setup_logging};
+use tracing::{Level, info};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 初始化日志
-    SimpleLogger::new()
-        .with_level(LevelFilter::Debug)
-        .init()
-        .unwrap();
+    // 初始化日志，使用DEBUG级别
+    setup_logging(Level::DEBUG, "SSH_PROXY");
     
     // 配置SSH服务器
     let config = SshServerConfig {
@@ -18,6 +14,14 @@ async fn main() -> anyhow::Result<()> {
         default_username: "admin".to_string(),
         default_password: "password".to_string(),
     };
+    
+    // 记录服务器配置信息
+    info!(
+        addr = %config.listen_addr,
+        port = config.listen_port,
+        username = %config.default_username,
+        "启动SSH服务器示例"
+    );
     
     // 创建并运行SSH服务器
     let mut server = SshServer::new(config);

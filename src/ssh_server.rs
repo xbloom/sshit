@@ -9,6 +9,9 @@ use tokio::sync::Mutex;
 use russh::server::{Auth, Msg, Server, Session};
 use russh::{Channel, ChannelId, Pty};
 
+// 在文件顶部添加tracing的use语句，新代码使用tracing
+use tracing;
+
 /// SSH Server Configuration
 #[derive(Clone)]
 pub struct SshServerConfig {
@@ -175,25 +178,42 @@ impl russh::server::Handler for SshServer {
     type Error = anyhow::Error;
 
     async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
-        info!("用户 {} 尝试无密码认证", user);
+        // 使用tracing进行结构化日志记录
+        tracing::info!(
+            username = %user, 
+            auth_type = "none", 
+            "用户尝试无密码认证"
+        );
+        
         // Only accept if username matches the default
         if user == self.config.default_username {
-            info!("用户 {} 无密码认证成功", user);
+            tracing::info!(username = %user, "无密码认证成功");
             return Ok(Auth::Accept);
         }
+        
+        tracing::warn!(username = %user, "无密码认证被拒绝");
         Ok(Auth::reject())
     }
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
-        info!("用户 {} 尝试使用密码进行认证", user);
+        // 使用tracing进行结构化日志记录
+        tracing::info!(
+            username = %user, 
+            auth_type = "password", 
+            "用户尝试密码认证"
+        );
         
         // Check if username and password match the defaults
         if user == self.config.default_username && password == self.config.default_password {
-            info!("用户 {} 密码认证成功", user);
+            tracing::info!(username = %user, "密码认证成功");
             return Ok(Auth::Accept);
         }
         
-        info!("用户 {} 密码认证失败", user);
+        tracing::warn!(
+            username = %user, 
+            success = false, 
+            "密码认证失败"
+        );
         Ok(Auth::reject())
     }
 
@@ -203,7 +223,15 @@ impl russh::server::Handler for SshServer {
     }
 
     async fn channel_open_session(&mut self, channel: Channel<Msg>, session: &mut Session) -> Result<bool, Self::Error> {
-        info!("会话通道已打开");
+        // 使用span记录会话生命周期
+        let span = tracing::info_span!(
+            "ssh_session", 
+            session_id = self.id, 
+            channel_id = ?channel.id()
+        );
+        let _guard = span.enter();
+        
+        tracing::info!("会话通道已打开");
         let mut sessions = self.sessions.lock().await;
         sessions.insert(self.id, SessionInfo {
             channel_id: channel.id(),
@@ -225,18 +253,32 @@ impl russh::server::Handler for SshServer {
         modes: &[(Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        info!("收到终端请求: {} ({}x{})", term, col_width, row_height);
+        tracing::info!(
+            terminal = %term,
+            cols = col_width,
+            rows = row_height,
+            "收到终端请求"
+        );
         
         // 1. 验证终端类型
         if !is_valid_terminal_type(term) {
-            warn!("不支持的终端类型: {}", term);
+            tracing::warn!(
+                terminal = %term,
+                channel = ?channel,
+                "不支持的终端类型"
+            );
             session.channel_failure(channel)?;
             return Ok(());
         }
         
         // 2. 验证终端大小
         if !is_valid_terminal_size(col_width, row_height) {
-            warn!("无效的终端大小: {}x{}", col_width, row_height);
+            tracing::warn!(
+                cols = col_width, 
+                rows = row_height,
+                channel = ?channel,
+                "无效的终端大小"
+            );
             session.channel_failure(channel)?;
             return Ok(());
         }

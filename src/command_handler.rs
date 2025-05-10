@@ -2,20 +2,18 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::io::{Read, Write};
 use std::collections::HashMap;
-use std::os::unix::process::ExitStatusExt;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use log::{info, error, debug};
+use log::{info, error};
 use tokio::process::{Command, Child};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use russh::CryptoVec;
 use russh::ChannelId;
 use russh::server::Handle;
-use tokio::sync::mpsc::{channel, Sender, Receiver};
 
-// 使用portable-pty替代tokio-pty-process
-use portable_pty::{PtyPair, PtySize, CommandBuilder, native_pty_system, Child as PtyChild, MasterPty};
+// 使用portable-pty，移除未使用的PtyPair
+use portable_pty::{PtySize, CommandBuilder, native_pty_system, Child as PtyChild, MasterPty};
 use std::sync::Mutex as StdMutex;
 
 /// 命令执行器接口，负责命令的实际执行
@@ -124,7 +122,7 @@ impl CommandExecutor for DefaultCommandExecutor {
         };
         
         // 获取锁并调整大小
-        let mut master = pty.lock().map_err(|_| anyhow::anyhow!("获取PTY锁失败"))?;
+        let master = pty.lock().map_err(|_| anyhow::anyhow!("获取PTY锁失败"))?;
         master.resize(pty_size)
             .map_err(|e| anyhow::anyhow!("调整PTY大小失败: {}", e))
     }
@@ -245,14 +243,14 @@ impl CommandHandler {
         // 创建读取器
         let reader = {
             // 需要在锁的范围内获取reader
-            let mut master = master_pty.lock().map_err(|_| anyhow::anyhow!("获取PTY锁失败"))?;
+            let master = master_pty.lock().map_err(|_| anyhow::anyhow!("获取PTY锁失败"))?;
             master.try_clone_reader()
                 .map_err(|e| anyhow::anyhow!("无法克隆PTY读取器: {}", e))?
         };
         
         // 创建写入器 - 注意这里的writer会消耗掉主PTY的写入器，所以不是克隆
         let writer: Box<dyn Write + Send> = {
-            let mut master = master_pty.lock().map_err(|_| anyhow::anyhow!("获取PTY锁失败"))?;
+            let master = master_pty.lock().map_err(|_| anyhow::anyhow!("获取PTY锁失败"))?;
             Box::new(master.take_writer().map_err(|e| anyhow::anyhow!("无法获取PTY写入器: {}", e))?)
         };
             

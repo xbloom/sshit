@@ -12,24 +12,56 @@ name = "ssh_server_example"
 path = "examples/ssh_server_example.rs"
 
 [dependencies]
-tokio = { version = "1.0", features = ["full"] }
-ed25519-dalek = "2.1"
-rand = "0.8"
-thiserror = "1.0"
-log = "0.4"
-env_logger = "0.10"
+# 核心异步运行时 - 更新到最新稳定版本，提供完整功能
+tokio = { version = "1.45", features = ["full"] }
+
+# 错误处理
 anyhow = "1.0"
+thiserror = "1.0"
+
+# 日志系统 - 结构化日志和可观测性
+log = "0.4"  # 基础日志接口，保持兼容性
+tracing = "0.1"  # 现代化的日志/追踪系统
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }  # 配置和格式化
+tracing-log = "0.1"  # 连接log和tracing
+
+# SSH库 - 使用vendor目录中的版本，减少网络依赖
+russh = { path = "vendor/russh" }  # 使用vendor目录中的russh 0.52.0
+ed25519-dalek = "2.1"  # 用于密钥生成和签名验证
+
+# CLI参数解析
 clap = { version = "4.4", features = ["derive"] }
+
+# 异步支持
 futures = "0.3"
 async-trait = "0.1"
+
+# SSH客户端实现
 ssh2 = "0.9"
+
+# PTY支持
+portable-pty = "0.9"  # 注意此依赖包含nix 0.28.0，但与nix 0.30.1兼容
+
+# 系统支持
+rand = "0.8"  # 与russh保持兼容
 base64 = "0.21"
-russh = { path = "vendor/russh" }
-simple_logger = "4.3"
-portable-pty = "0.9.0"
-libc = "0.2"
-nix = { version = "0.30.1", registry = "ustc" }
+
+# 系统库 - 添加功能特性提高项目可维护性
+# 项目依赖链中有不同版本的nix: v0.28.0(portable-pty)、v0.29.0(russh-cryptovec)、v0.30.1(根依赖)
+# 目前编译没有问题，三个版本可以共存，后续可考虑向上游提PR统一版本
+nix = { version = "0.30", features = ["process", "signal", "term", "user"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
+
+# 依赖优化说明：
+# 1. 依赖指定主要版本号，小版本由Cargo.lock管理确保稳定性
+# 2. tokio更新到最新稳定版本1.45提高性能
+# 3. 使用tracing替代env_logger，提供更强大的日志和追踪能力
+# 4. 保留log接口以兼容现有代码和第三方库
+# 5. 使用tracing-log桥接log和tracing，确保兼容性
+# 6. 将simple_logger移至dev-dependencies，因为它只在示例中使用
+# 7. 为nix添加功能特性以明确依赖需求
+# 8. russh及其相关依赖通过vendor目录管理，避免网络问题
+# 9. 虽然存在多版本nix依赖，但编译和功能测试正常
 

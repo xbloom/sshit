@@ -1,6 +1,5 @@
 use anyhow::Result;
 use clap::Parser;
-use log::info;
 use rand::Rng;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -13,6 +12,7 @@ mod command_handler;
 use key_manager::{KeyManager, SshKeyType};
 use ssh_client::SshClient;
 use ssh_server::{SshServer, SshServerConfig};
+use ssh_proxy::setup_logging;
 
 // Add a custom parser for SshKeyType from string
 impl FromStr for SshKeyType {
@@ -22,13 +22,13 @@ impl FromStr for SshKeyType {
         match s.to_lowercase().as_str() {
             "ed25519" => Ok(SshKeyType::Ed25519),
             "rsa" => Ok(SshKeyType::Rsa),
-            _ => Err(anyhow::anyhow!("Invalid key type: {}. Must be 'ed25519' or 'rsa'", s)),
+            _ => Err(anyhow::anyhow!("无效的SSH密钥类型: {}. 有效值: ed25519, rsa", s)),
         }
     }
 }
 
 #[derive(Parser, Debug)]
-#[clap(author, version, about = "SSH 代理工具，用于通过外部服务器连接到内部 SSH 服务器", long_about = None)]
+#[clap(name = "SSH Proxy", version = env!("CARGO_PKG_VERSION"), about = "SSH 代理工具")]
 struct Args {
     /// 远程 SSH 服务器主机
     #[clap(short = 'H', long)]
@@ -74,11 +74,23 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logger with appropriate log level (info and above)
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // 使用新的日志初始化函数，设置默认日志级别为INFO
+    setup_logging(tracing::Level::INFO, "SSH_PROXY");
+    
     let args = Args::parse();
 
+    // 使用span来跟踪关键操作
+    let setup_span = tracing::info_span!("setup");
+    let _setup_guard = setup_span.enter();
+    
     // Generate or use existing SSH key
+    tracing::debug!(
+        key_path = %args.key_path.display(), 
+        key_type = %args.key_type.as_str(),
+        use_existing = args.use_existing_key,
+        "设置SSH密钥"
+    );
+    
     let key_manager = KeyManager::new(&args.key_path, args.key_type, !args.use_existing_key)?;
     
     // If using existing key, check if it exists
@@ -93,8 +105,10 @@ async fn main() -> Result<()> {
     key_manager.setup_keypair()?;
     
     // Display the public key for user to configure on remote server
+    let pubkey = key_manager.get_public_key_string()?;
+    
     println!("\n=== SSH 公钥 ===");
-    println!("{}", key_manager.get_public_key_string()?);
+    println!("{}", pubkey);
     println!("请在远程服务器上为用户 {} 配置此密钥", args.user);
     
     if !args.use_existing_key {
@@ -105,6 +119,15 @@ async fn main() -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
 
+    // 连接操作使用新的span
+    let connection_span = tracing::info_span!(
+        "ssh_connection", 
+        host = %args.remote_host, 
+        port = args.remote_port, 
+        user = %args.user
+    );
+    let _connection_guard = connection_span.enter();
+
     // Connect to remote server
     let mut client = SshClient::new(
         args.remote_host.clone(), 
@@ -113,12 +136,12 @@ async fn main() -> Result<()> {
         args.key_path.clone()
     );
     
-    info!("正在连接远程 SSH 服务器...");
+    tracing::info!("正在连接远程SSH服务器...");
     client.connect().await?;
     
     // Choose a random port for the SSH server on the remote machine
     let remote_proxy_port = rand::thread_rng().gen_range(10000..65535);
-    info!("在远程端口 {} 上启动 SSH 代理", remote_proxy_port);
+    tracing::info!(port = remote_proxy_port, "在远程端口上启动SSH代理");
     
     // Start SSH server with default credentials
     let ssh_server = SshServer::new(
@@ -139,8 +162,15 @@ async fn main() -> Result<()> {
     println!("ssh -p {} {}@{}", remote_proxy_port, args.server_username, args.remote_host);
     println!("默认密码: {}", args.server_password);
     
+    tracing::info!(
+        remote_port = remote_proxy_port,
+        username = %args.server_username,
+        "SSH代理成功启动"
+    );
+    
     // Keep the connection alive
     tokio::signal::ctrl_c().await?;
+    tracing::info!("收到终止信号，正在关闭SSH代理...");
     println!("正在关闭 SSH 代理...");
     
     Ok(())
