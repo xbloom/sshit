@@ -7,6 +7,18 @@
         {
             "type": "lldb",
             "request": "launch",
+            "name": "Cargo ssh_server_example",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--example=ssh_server_example"
+                ]
+            },
+            "args": []
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
             "name": "Debug executable 'ssh-proxy'",
             "cargo": {
                 "args": [
