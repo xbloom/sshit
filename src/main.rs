@@ -8,6 +8,7 @@ use std::str::FromStr;
 mod key_manager;
 mod ssh_client;
 mod ssh_server;
+mod command_handler;
 
 use key_manager::{KeyManager, SshKeyType};
 use ssh_client::SshClient;
@@ -61,6 +62,14 @@ struct Args {
     /// 密钥文件应位于由 -k/--key_path 指定的路径
     #[clap(short = 'e', long)]
     use_existing_key: bool,
+
+    /// SSH 服务器默认用户名
+    #[clap(long, default_value = "admin")]
+    server_username: String,
+
+    /// SSH 服务器默认密码
+    #[clap(long, default_value = "password")]
+    server_password: String,
 }
 
 #[tokio::main]
@@ -111,12 +120,14 @@ async fn main() -> Result<()> {
     let remote_proxy_port = rand::thread_rng().gen_range(10000..65535);
     info!("在远程端口 {} 上启动 SSH 代理", remote_proxy_port);
     
-    // Start SSH server
+    // Start SSH server with default credentials
     let ssh_server = SshServer::new(
         SshServerConfig {
             listen_addr: args.local_host,
             listen_port: args.local_port,
             key_path: None, // 我们会生成一个随机密钥
+            default_username: args.server_username.clone(),
+            default_password: args.server_password.clone(),
         }
     );
     
@@ -125,7 +136,8 @@ async fn main() -> Result<()> {
     
     println!("SSH 代理正在运行。");
     println!("使用以下命令连接到您的内部机器：");
-    println!("ssh -p {} user@{}", remote_proxy_port, args.remote_host);
+    println!("ssh -p {} {}@{}", remote_proxy_port, args.server_username, args.remote_host);
+    println!("默认密码: {}", args.server_password);
     
     // Keep the connection alive
     tokio::signal::ctrl_c().await?;

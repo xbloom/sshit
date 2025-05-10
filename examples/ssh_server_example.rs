@@ -15,6 +15,8 @@ async fn main() -> anyhow::Result<()> {
         listen_addr: "0.0.0.0".to_string(),
         listen_port: 2222,
         key_path: None, // 使用随机生成的密钥
+        default_username: "admin".to_string(),
+        default_password: "password".to_string(),
     };
     
     // 创建并运行SSH服务器

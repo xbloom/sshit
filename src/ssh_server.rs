@@ -6,8 +6,7 @@ use anyhow::Result;
 use log::{debug, error, info};
 use tokio::sync::Mutex;
 use russh::server::{Auth, Msg, Server, Session};
-use russh::{Channel, ChannelId, CryptoVec};
-use async_trait::async_trait;
+use russh::{Channel, ChannelId};
 
 /// SSH Server Configuration
 #[derive(Clone)]
@@ -17,7 +16,12 @@ pub struct SshServerConfig {
     /// Port to listen on
     pub listen_port: u16,
     /// Path to the server's private key
+    #[allow(dead_code)]
     pub key_path: Option<String>,
+    /// Default username for authentication
+    pub default_username: String,
+    /// Default password for authentication
+    pub default_password: String,
 }
 
 /// SSH Server implementation
@@ -39,6 +43,7 @@ impl SshServer {
     }
 
     /// Run the SSH server
+    #[allow(dead_code)]
     pub async fn run(&mut self) -> Result<()> {
         // Either load the key from the specified path or generate a random one
         let server_key = if let Some(key_path) = &self.config.key_path {
@@ -82,28 +87,16 @@ impl SshServer {
         
         Ok(())
     }
-    
-    /// Get the configured listen address
-    pub fn get_listen_addr(&self) -> &str {
-        &self.config.listen_addr
-    }
-    
-    /// Get the configured listen port
-    pub fn get_listen_port(&self) -> u16 {
-        self.config.listen_port
-    }
 }
 
 impl russh::server::Server for SshServer {
-    type Handler = SshHandler;
+    type Handler = Self;
     
     fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Self::Handler {
-        let id = self.id;
+        let mut s = self.clone();
+        s.id = self.id;
         self.id += 1;
-        SshHandler {
-            clients: self.clients.clone(),
-            id,
-        }
+        s
     }
     
     fn handle_session_error(&mut self, error: <Self::Handler as russh::server::Handler>::Error) {
@@ -111,72 +104,124 @@ impl russh::server::Server for SshServer {
     }
 }
 
-/// Handler for SSH client sessions
-#[derive(Clone)]
-pub struct SshHandler {
-    clients: Arc<Mutex<HashMap<usize, (ChannelId, russh::server::Handle)>>>,
-    id: usize,
-}
-
-#[async_trait]
-impl russh::server::Handler for SshHandler {
+impl russh::server::Handler for SshServer {
     type Error = anyhow::Error;
 
-    fn auth_none(&mut self, user: &str) -> impl std::future::Future<Output = Result<Auth, Self::Error>> + Send {
-        async move {
-            info!("用户 {} 尝试无密码认证", user);
-            Ok(Auth::reject())
+    async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
+        info!("用户 {} 尝试无密码认证", user);
+        // Only accept if username matches the default
+        if user == self.config.default_username {
+            info!("用户 {} 无密码认证成功", user);
+            return Ok(Auth::Accept);
         }
+        Ok(Auth::reject())
     }
 
-    fn auth_password(&mut self, user: &str, password: &str) -> impl std::future::Future<Output = Result<Auth, Self::Error>> + Send {
-        async move {
-            info!("用户 {} 尝试使用密码: {} 进行认证", user, password);
-            Ok(Auth::reject())
+    async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+        info!("用户 {} 尝试使用密码进行认证", user);
+        
+        // Check if username and password match the defaults
+        if user == self.config.default_username && password == self.config.default_password {
+            info!("用户 {} 密码认证成功", user);
+            return Ok(Auth::Accept);
         }
+        
+        info!("用户 {} 密码认证失败", user);
+        Ok(Auth::reject())
     }
 
-    fn auth_publickey(&mut self, user: &str, _public_key: &russh::keys::ssh_key::PublicKey) -> impl std::future::Future<Output = Result<Auth, Self::Error>> + Send {
-        async move {
-            info!("用户 {} 尝试使用公钥认证", user);
-            Ok(Auth::reject())
-        }
+    async fn auth_publickey(&mut self, user: &str, _public_key: &russh::keys::ssh_key::PublicKey) -> Result<Auth, Self::Error> {
+        info!("用户 {} 尝试使用公钥认证", user);
+        Ok(Auth::reject())
     }
 
-    fn channel_open_session(&mut self, channel: Channel<Msg>, session: &mut Session) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
-        async move {
-            info!("会话通道已打开");
-            let mut clients = self.clients.lock().await;
-            clients.insert(self.id, (channel.id(), session.handle()));
-            Ok(true)
-        }
+    async fn channel_open_session(&mut self, channel: Channel<Msg>, session: &mut Session) -> Result<bool, Self::Error> {
+        info!("会话通道已打开");
+        let mut clients = self.clients.lock().await;
+        clients.insert(self.id, (channel.id(), session.handle()));
+        Ok(true)
     }
     
-    fn data(&mut self, channel: ChannelId, data: &[u8], session: &mut Session) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        async move {
-            debug!("在通道 {} 上收到数据: {:?}", channel, data);
-            // 如果收到 Ctrl+C 则断开连接
-            if data == [3] {
-                return Err(russh::Error::Disconnect.into());
-            }
-
-            let data = CryptoVec::from(format!("回显: {}\r\n", String::from_utf8_lossy(data)));
-            // post数据需要单独处理因为self已经被借用
-            {
-                let mut clients = self.clients.lock().await;
-                for (id, (ch, ref mut s)) in clients.iter_mut() {
-                    if *id != self.id {
-                        let _ = s.data(*ch, data.clone()).await;
-                    }
+    async fn pty_request(
+        &mut self,
+        channel: ChannelId,
+        term: &str,
+        col_width: u32,
+        row_height: u32,
+        _pix_width: u32,
+        _pix_height: u32,
+        _modes: &[(russh::Pty, u32)],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        info!("收到终端请求: {} ({}x{})", term, col_width, row_height);
+        session.channel_success(channel)?;
+        Ok(())
+    }
+    
+    async fn shell_request(&mut self, channel: ChannelId, session: &mut Session) -> Result<(), Self::Error> {
+        info!("收到 shell 请求");
+        
+        // Use the command handler
+        if let Some((_, ch)) = self.clients.lock().await.get(&self.id).cloned() {
+            let cmd_handler = crate::command_handler::CommandHandler::default();
+            
+            tokio::spawn(async move {
+                if let Err(e) = cmd_handler.start_shell(channel, ch).await {
+                    error!("启动 shell 失败: {}", e);
                 }
-            }
-            session.data(channel, data)?;
-            Ok(())
+            });
         }
+        
+        session.channel_success(channel)?;
+        Ok(())
+    }
+    
+    async fn exec_request(&mut self, channel: ChannelId, command: &[u8], session: &mut Session) -> Result<(), Self::Error> {
+        let cmd = String::from_utf8_lossy(command).to_string();
+        info!("收到执行命令请求: {}", cmd);
+        
+        // Use the command handler
+        if let Some((_, session)) = self.clients.lock().await.get(&self.id).cloned() {
+            let cmd_handler = crate::command_handler::CommandHandler::default();
+            
+            tokio::spawn(async move {
+                if let Err(e) = cmd_handler.execute_command(cmd, channel, session).await {
+                    error!("执行命令失败: {}", e);
+                }
+            });
+        }
+        
+        session.channel_success(channel)?;
+        Ok(())
+    }
+    
+    async fn window_change_request(
+        &mut self,
+        channel: ChannelId,
+        col_width: u32,
+        row_height: u32,
+        _pix_width: u32,
+        _pix_height: u32,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        info!("窗口大小更改请求: {}x{}", col_width, row_height);
+        session.channel_success(channel)?;
+        Ok(())
+    }
+    
+    async fn data(&mut self, channel: ChannelId, data: &[u8], _session: &mut Session) -> Result<(), Self::Error> {
+        debug!("在通道 {} 上收到数据: {:?}", channel, data);
+        
+        // If received Ctrl+C, disconnect
+        if data == [3] {
+            return Err(russh::Error::Disconnect.into());
+        }
+        
+        Ok(())
     }
 }
 
-impl Drop for SshHandler {
+impl Drop for SshServer {
     fn drop(&mut self) {
         let id = self.id;
         let clients = self.clients.clone();
