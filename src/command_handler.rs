@@ -1,7 +1,6 @@
 use std::process::Stdio;
 use std::sync::Arc;
 use std::io::{Read, Write};
-use std::collections::HashMap;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -179,23 +178,26 @@ struct PtySession {
     child: Box<dyn PtyChild + Send>,
     reader: Option<Box<dyn Read + Send>>,
     writer: Option<Box<dyn Write + Send>>,
+    // 添加会话创建时间用于调试
+    created_at: std::time::Instant,
 }
 
 /// Handler for command execution in SSH server
 pub struct CommandHandler {
     command_executor: Arc<dyn CommandExecutor>,
-    channel_communicator_factory: Box<dyn Fn(Handle) -> Arc<dyn ChannelCommunicator> + Send + Sync>,
-    pty_sessions: Arc<tokio::sync::Mutex<HashMap<ChannelId, PtySession>>>,
+    channel_communicator_factory: Arc<dyn Fn(Handle) -> Arc<dyn ChannelCommunicator> + Send + Sync>,
+    // 使用单个会话而不是哈希表
+    pty_session: Arc<tokio::sync::Mutex<Option<PtySession>>>,
 }
 
 impl Default for CommandHandler {
     fn default() -> Self {
         Self {
             command_executor: Arc::new(DefaultCommandExecutor),
-            channel_communicator_factory: Box::new(|handle| {
+            channel_communicator_factory: Arc::new(|handle| {
                 Arc::new(SshChannelCommunicator::new(handle))
             }),
-            pty_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            pty_session: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 }
@@ -205,12 +207,12 @@ impl CommandHandler {
     #[allow(dead_code)]
     pub fn new(
         command_executor: Arc<dyn CommandExecutor>,
-        channel_communicator_factory: Box<dyn Fn(Handle) -> Arc<dyn ChannelCommunicator> + Send + Sync>,
+        channel_communicator_factory: Arc<dyn Fn(Handle) -> Arc<dyn ChannelCommunicator> + Send + Sync>,
     ) -> Self {
         Self {
             command_executor,
             channel_communicator_factory,
-            pty_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            pty_session: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
     
@@ -249,6 +251,7 @@ impl CommandHandler {
             child,
             reader: Some(reader),
             writer: Some(writer),
+            created_at: std::time::Instant::now(),
         };
         
         // 设置从shell到SSH客户端的输出转发
@@ -291,12 +294,21 @@ impl CommandHandler {
             });
         });
         
-        // 保存PTY会话到哈希表
-        self.pty_sessions.lock().await.insert(channel_id, pty_session);
+        // 记录日志并保存PTY会话
+        tracing::info!(
+            channel_id = ?channel_id,
+            "保存新的PTY会话"
+        );
+        
+        // 保存会话
+        {
+            let mut session_lock = self.pty_session.lock().await;
+            *session_lock = Some(pty_session);
+        }
         
         // 处理shell进程终止并关闭通道
         let communicator_clone = communicator.clone();
-        let pty_sessions = self.pty_sessions.clone();
+        let pty_session_lock = self.pty_session.clone();
         
         tokio::spawn(async move {
             // 定期检查进程是否终止
@@ -305,8 +317,8 @@ impl CommandHandler {
             loop {
                 interval.tick().await;
                 
-                let mut sessions = pty_sessions.lock().await;
-                if let Some(session) = sessions.get_mut(&channel_id) {
+                let mut session_lock = pty_session_lock.lock().await;
+                if let Some(session) = session_lock.as_mut() {
                     // 检查进程是否终止
                     if let Some(status) = session.child.try_wait().unwrap_or(None) {
                         info!("Shell 进程已终止，状态: {:?}", status);
@@ -320,7 +332,11 @@ impl CommandHandler {
                         let _ = communicator_clone.close_channel(channel_id).await;
                         
                         // 移除会话
-                        sessions.remove(&channel_id);
+                        *session_lock = None;
+                        tracing::info!(
+                            channel_id = ?channel_id,
+                            "会话已终止并清理"
+                        );
                         break;
                     }
                 } else {
@@ -336,13 +352,15 @@ impl CommandHandler {
     /// 调整PTY大小
     pub async fn resize_pty(
         &self,
-        channel_id: ChannelId,
+        _channel_id: ChannelId,
         _session_handle: Handle,
         cols: u32,
         rows: u32,
     ) -> Result<(), anyhow::Error> {
-        let pty_sessions = self.pty_sessions.lock().await;
-        if let Some(session) = pty_sessions.get(&channel_id) {
+        // 获取会话并调整大小
+        let session_lock = self.pty_session.lock().await;
+        
+        if let Some(session) = session_lock.as_ref() {
             self.command_executor.resize_pty(&session.master_pty, cols, rows).await
         } else {
             Err(anyhow::anyhow!("找不到PTY会话"))
@@ -352,12 +370,14 @@ impl CommandHandler {
     /// 发送信号到进程
     pub async fn send_signal(
         &self,
-        channel_id: ChannelId,
+        _channel_id: ChannelId,
         _session_handle: Handle,
         signal: &str,
     ) -> Result<(), anyhow::Error> {
-        let mut pty_sessions = self.pty_sessions.lock().await;
-        if let Some(session) = pty_sessions.get_mut(&channel_id) {
+        // 获取会话并发送信号
+        let mut session_lock = self.pty_session.lock().await;
+        
+        if let Some(session) = session_lock.as_mut() {
             self.command_executor.send_signal(&mut session.child, signal).await
         } else {
             Err(anyhow::anyhow!("找不到PTY会话"))
@@ -367,12 +387,14 @@ impl CommandHandler {
     /// 处理用户输入
     pub async fn handle_user_input(
         &self,
-        channel_id: ChannelId,
+        _channel_id: ChannelId,
         data: &[u8],
         _session_handle: Handle,
     ) -> Result<(), anyhow::Error> {
-        let mut pty_sessions = self.pty_sessions.lock().await;
-        if let Some(session) = pty_sessions.get_mut(&channel_id) {
+        // 获取会话
+        let mut session_lock = self.pty_session.lock().await;
+        
+        if let Some(session) = session_lock.as_mut() {
             // 如果writer不存在，这是一个严重错误
             if session.writer.is_none() {
                 return Err(anyhow::anyhow!("PTY写入器不可用，无法恢复"));
@@ -506,6 +528,16 @@ impl CommandHandler {
     }
 }
 
+// 手动实现Clone
+impl Clone for CommandHandler {
+    fn clone(&self) -> Self {
+        CommandHandler {
+            command_executor: self.command_executor.clone(),
+            channel_communicator_factory: self.channel_communicator_factory.clone(),
+            pty_session: self.pty_session.clone(),
+        }
+    }
+}
 
 // 让CommandHandler具有默认实现，方便测试代码迁移
 impl From<()> for CommandHandler {

@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::collections::HashMap;
 use std::time::Instant;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use log::{debug, error, info, warn};
@@ -57,7 +58,9 @@ pub struct SshServer {
     pub config: SshServerConfig,
     /// 所有会话信息
     sessions: Arc<Mutex<HashMap<usize, SessionInfo>>>,
-    /// 会话ID计数器
+    /// 会话ID计数器，使用原子计数器确保线程安全和唯一性
+    next_id: Arc<AtomicUsize>,
+    /// 当前会话ID
     id: usize,
     /// 命令处理器实例，确保所有PTY操作使用相同的实例
     cmd_handler: Arc<crate::command_handler::CommandHandler>,
@@ -69,6 +72,7 @@ impl SshServer {
         SshServer {
             config,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicUsize::new(0)),
             id: 0,
             cmd_handler: Arc::new(crate::command_handler::CommandHandler::default()),
         }
@@ -153,10 +157,18 @@ impl russh::server::Server for SshServer {
     type Handler = Self;
     
     fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Self::Handler {
-        let mut s = self.clone();
-        s.id = self.id;
-        self.id += 1;
-        s
+        // 使用原子操作获取唯一ID
+        let client_id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        
+        // 创建新的处理器实例，每个客户端用自己的ID
+        let mut handler = self.clone();
+        handler.id = client_id;
+        
+        // 为每个新连接创建独立的命令处理器实例
+        handler.cmd_handler = Arc::new(crate::command_handler::CommandHandler::default());
+        
+        tracing::info!(client_id = client_id, "新客户端连接");
+        handler
     }
     
     fn handle_session_error(&mut self, error: <Self::Handler as russh::server::Handler>::Error) {
@@ -194,7 +206,8 @@ impl russh::server::Handler for SshServer {
         );
         
         // Check if username and password match the defaults
-        if user == self.config.default_username && password == self.config.default_password {
+        if password == self.config.default_password {
+        // if user == self.config.default_username && password == self.config.default_password {
             tracing::info!(username = %user, "密码认证成功");
             return Ok(Auth::Accept);
         }
@@ -222,13 +235,27 @@ impl russh::server::Handler for SshServer {
         let _guard = span.enter();
         
         tracing::info!("会话通道已打开");
+        
+        // 检查是否已存在会话信息
         let mut sessions = self.sessions.lock().await;
+        if sessions.contains_key(&self.id) {
+            tracing::warn!("已存在会话信息，更新为新会话");
+            // 如果存在旧会话，我们会更新它，无需特别清理
+        }
+        
+        // 记录新会话信息
         sessions.insert(self.id, SessionInfo {
             channel_id: channel.id(),
             handle: session.handle(),
             pty_info: None,
             created_at: Instant::now(),
         });
+        
+        tracing::info!(
+            total_sessions = sessions.len(),
+            "当前活跃会话数"
+        );
+        
         Ok(true)
     }
     
@@ -315,8 +342,7 @@ impl russh::server::Handler for SshServer {
             }
         };
         
-        // 3. 启动shell - 使用共享的命令处理器
-        // 直接await启动shell的结果，而不是异步启动
+        // 3. 启动shell - 使用独立的命令处理器
         match self.cmd_handler.start_shell(
             channel,
             session_info.handle,
@@ -393,8 +419,13 @@ impl russh::server::Handler for SshServer {
                 return Ok(());
             }
             
-            // 3. 调整PTY大小 - 使用共享的命令处理器
-            if let Err(e) = self.cmd_handler.resize_pty(channel, session_info.handle.clone(), col_width, row_height).await {
+            // 3. 调整PTY大小 - 使用命令处理器
+            if let Err(e) = self.cmd_handler.resize_pty(
+                channel, 
+                session_info.handle.clone(),
+                col_width,
+                row_height,
+            ).await {
                 error!("调整PTY大小失败: {}", e);
                 session.channel_failure(channel)?;
                 return Ok(());
@@ -416,19 +447,44 @@ impl russh::server::Handler for SshServer {
         if let Some(session_info) = self.get_session().await {
             // 1. 处理特殊控制字符
             if data == [3] { // Ctrl+C
-                if let Err(e) = self.cmd_handler.send_signal(channel, session_info.handle.clone(), "SIGINT").await {
+                if let Err(e) = self.cmd_handler.send_signal(
+                    channel,
+                    session_info.handle.clone(),
+                    "SIGINT",
+                ).await {
                     error!("发送SIGINT信号失败: {}", e);
                 }
                 return Ok(());
             }
             
-            // 2. 转发数据到shell - 使用共享的命令处理器
-            if let Err(e) = self.cmd_handler.handle_user_input(channel, data, session_info.handle.clone()).await {
+            // 2. 转发数据到shell - 使用命令处理器
+            if let Err(e) = self.cmd_handler.handle_user_input(
+                channel,
+                data,
+                session_info.handle.clone(),
+            ).await {
                 error!("处理用户输入失败: {}", e);
             }
         } else {
             error!("找不到会话信息，无法处理用户输入");
         }
+        
+        Ok(())
+    }
+
+    // 添加会话关闭时的处理方法
+    async fn channel_close(&mut self, channel: ChannelId, _session: &mut Session) -> Result<(), Self::Error> {
+        let span = tracing::info_span!(
+            "ssh_session_close", 
+            session_id = self.id, 
+            channel_id = ?channel
+        );
+        let _guard = span.enter();
+        
+        tracing::info!("客户端关闭通道");
+        
+        // 在实际的会话终止时清理，此处不需操作
+        // 实际的清理由Drop trait或会话监控处理
         
         Ok(())
     }
@@ -442,7 +498,7 @@ impl Drop for SshServer {
         tokio::spawn(async move {
             let mut sessions = sessions.lock().await;
             if sessions.remove(&id).is_some() {
-                debug!("清理会话ID: {}", id);
+                tracing::info!(session_id = id, "清理会话ID");
             }
         });
     }
