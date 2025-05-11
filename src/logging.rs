@@ -3,9 +3,123 @@
 use tracing_subscriber::{fmt, EnvFilter, prelude::*};
 use tracing::Level;
 use std::sync::Once;
+use std::path::Path;
+use time::{OffsetDateTime, format_description};
+use regex::Regex;
 
 // 确保日志系统只初始化一次
 static INIT: Once = Once::new();
+
+/// 自定义格式化器，只显示文件名而不是完整路径
+struct CustomFormatter;
+
+impl<S, N> fmt::FormatEvent<S, N> for CustomFormatter
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &fmt::FmtContext<'_, S, N>,
+        mut writer: fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        // 使用time库格式化时间 - 压缩格式
+        let now = OffsetDateTime::now_utc();
+        let format = format_description::parse(
+            "[year repr:last_two]-[month]-[day] [hour]:[minute]:[second]"
+        ).unwrap_or_else(|_| format_description::parse("[hour]:[minute]:[second]").unwrap());
+        let formatted_time = now.format(&format).unwrap_or_else(|_| String::from("unknown time"));
+        write!(writer, "\x1b[90m{:<17}\x1b[0m ", formatted_time)?;  // 压缩日期格式
+
+        // 格式化线程ID - 使用稳定的方法
+        write!(writer, "\x1b[90m{:?}\x1b[0m ", std::thread::current().id())?;  // 使用稳定的线程信息
+
+        // 格式化日志级别（带颜色）- 保持明亮
+        let metadata = event.metadata();
+        let level = *metadata.level();
+        match level {
+            Level::TRACE => write!(writer, "\x1b[95m{:<5}\x1b[0m", "TRACE")?,  // 紫色
+            Level::DEBUG => write!(writer, "\x1b[96m{:<5}\x1b[0m", "DEBUG")?,  // 亮青色
+            Level::INFO => write!(writer, "\x1b[92m{:<5}\x1b[0m", "INFO")?,   // 亮绿色
+            Level::WARN => write!(writer, "\x1b[93m{:<5}\x1b[0m", "WARN")?,   // 亮黄色
+            Level::ERROR => write!(writer, "\x1b[91m{:<5}\x1b[0m", "ERROR")?,  // 亮红色
+        }
+        write!(writer, " ")?;
+
+        // 格式化目标（更淡的紫色）
+        // write!(writer, "\x1b[38;5;189m[{}]\x1b[0m ", metadata.target())?;  // 更淡的紫色，不固定宽度
+
+        // 格式化文件名和行号 - 淡蓝色
+        if let Some(file) = metadata.file() {
+            let file_name = Path::new(file)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(file);
+            if let Some(line) = metadata.line() {
+                write!(writer, "\x1b[38;5;153m{:<15}:{:<4}\x1b[0m: ", file_name, line)?;  // 淡蓝色，固定宽度
+            } else {
+                write!(writer, "\x1b[38;5;153m{:<15}\x1b[0m: ", file_name)?;  // 淡蓝色，固定宽度
+            }
+        }
+
+        // 格式化字段（日志内容）- 变量用彩虹色，普通内容用亮金色
+        let mut field_buf = String::new();
+        let field_writer = fmt::format::Writer::new(&mut field_buf);
+        ctx.field_format().format_fields(field_writer, event)?;
+
+        let rainbow_colors = [
+            "\x1b[38;5;224m", // 更淡橙
+            "\x1b[38;5;194m", // 更淡绿
+            "\x1b[38;5;195m", // 更淡蓝
+            "\x1b[38;5;225m", // 更淡紫
+            "\x1b[38;5;230m", // 更淡黄
+            "\x1b[38;5;159m", // 淡青
+        ];
+        let mut color_index = 0;
+        let re = Regex::new(r"\b([\w\-]+)=([^\s]+)").unwrap();
+        let mut last = 0;
+        let mut formatted = String::new();
+        let mut first_var = true;
+        for cap in re.captures_iter(&field_buf) {
+            let m = cap.get(0).unwrap();
+            // 普通内容（变量前）
+            if m.start() > last {
+                let normal = &field_buf[last..m.start()];
+                if !normal.trim().is_empty() {
+                    formatted.push_str("\x1b[1m\x1b[38;5;228m");
+                    formatted.push_str(normal);
+                    formatted.push_str("\x1b[0m");
+                }
+            }
+            // 变量内容
+            if !first_var {
+                formatted.push(' ');
+            }
+            first_var = false;
+            let color = rainbow_colors[color_index % rainbow_colors.len()];
+            color_index += 1;
+            formatted.push_str(color);
+            formatted.push_str(&cap[1]);
+            formatted.push_str("=\x1b[0m");
+            formatted.push_str(color);
+            formatted.push_str(&cap[2]);
+            formatted.push_str("\x1b[0m");
+            last = m.end();
+        }
+        // 剩余普通内容
+        if last < field_buf.len() {
+            let normal = &field_buf[last..];
+            if !normal.trim().is_empty() {
+                formatted.push_str("\x1b[1m\x1b[38;5;228m");
+                formatted.push_str(normal);
+                formatted.push_str("\x1b[0m");
+            }
+        }
+        write!(writer, "{}", formatted)?;
+        writeln!(writer)
+    }
+}
 
 /// 日志系统初始化函数
 /// 
@@ -39,15 +153,9 @@ pub fn setup_logging(default_level: Level, app_name: &str) {
         let filter = EnvFilter::try_from_env(env_name)
             .unwrap_or_else(|_| {
                 // ssh_proxy=debug 意味着我们的代码使用DEBUG级别，依赖库使用默认级别
-                EnvFilter::new(format!("{},ssh_proxy={}", default_directive, default_directive))
+                // 添加russh=warn来过滤掉russh库的调试日志
+                EnvFilter::new(format!("{},ssh_proxy={},russh=warn", default_directive, default_directive))
             });
-        
-        // 设置控制台日志格式
-        let fmt_layer = fmt::layer()
-            .with_target(true)     // 显示目标模块
-            .with_thread_ids(true) // 在多线程环境中显示线程ID
-            .with_file(true)       // 显示文件名
-            .with_line_number(true); // 显示行号
         
         // 使用JSON格式作为可选，通过环境变量启用
         if std::env::var(format!("{}_JSON", app_name)).is_ok() {
@@ -63,10 +171,10 @@ pub fn setup_logging(default_level: Level, app_name: &str) {
         } else {
             // 必须先初始化LogTracer，确保log crate的消息能被正确处理
             if let Ok(()) = tracing_log::LogTracer::init() {
-                // 使用普通文本格式
+                // 使用普通文本格式，但使用自定义格式化器只显示文件名
                 tracing_subscriber::registry()
                     .with(filter)
-                    .with(fmt_layer)
+                    .with(fmt::layer().event_format(CustomFormatter).with_ansi(true))
                     .try_init()
                     .ok(); // 忽略可能的错误
             }

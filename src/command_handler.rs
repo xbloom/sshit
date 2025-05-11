@@ -11,9 +11,83 @@ use russh::CryptoVec;
 use russh::ChannelId;
 use russh::server::Handle;
 
+// 添加tracing
+use tracing;
+
 // 使用portable-pty，移除未使用的PtyPair
 use portable_pty::{PtySize, CommandBuilder, native_pty_system, Child as PtyChild, MasterPty};
 use std::sync::Mutex as StdMutex;
+
+/// 命令日志记录器，用于收集和记录用户输入的命令
+struct CommandLogger {
+    /// 命令缓冲区，用于收集用户输入的命令
+    cmd_buffer: Arc<tokio::sync::Mutex<String>>,
+}
+
+impl CommandLogger {
+    /// 创建一个新的命令日志记录器
+    fn new() -> Self {
+        Self {
+            cmd_buffer: Arc::new(tokio::sync::Mutex::new(String::new())),
+        }
+    }
+
+    /// 处理用户输入，收集命令并在检测到回车键时记录完整命令
+    async fn process_input(&self, channel_id: ChannelId, data: &[u8]) {
+        // 检查是否包含回车键（ASCII 13）或换行符（ASCII 10）
+        let contains_enter = data.iter().any(|&b| b == 13 || b == 10);
+        
+        // 尝试将输入转换为字符串
+        if let Ok(input) = String::from_utf8(data.to_vec()) {
+            let mut buffer = self.cmd_buffer.lock().await;
+            
+            // 如果是退格键（ASCII 127或8），删除缓冲区最后一个字符
+            if data.len() == 1 && (data[0] == 127 || data[0] == 8) {
+                buffer.pop();
+            } else {
+                // 否则添加到缓冲区
+                buffer.push_str(&input);
+            }
+            
+            // 如果检测到回车键，记录完整命令并清空缓冲区
+            if contains_enter {
+                // 清理命令字符串，去除控制字符和换行符
+                let cmd = buffer.trim_end_matches(|c| c == '\r' || c == '\n')
+                    .trim()
+                    .to_string();
+                
+                // 只记录非空命令
+                if !cmd.is_empty() {
+                    tracing::info!(
+                        channel_id = ?channel_id,
+                        command = %cmd,
+                        "shell执行命令"
+                    );
+                }
+                
+                // 清空缓冲区
+                buffer.clear();
+            }
+        }
+    }
+
+    /// 记录执行的命令
+    fn log_command(channel_id: ChannelId, command: &str) {
+        tracing::info!(
+            channel_id = ?channel_id,
+            command = %command,
+            "exec执行命令"
+        );
+    }
+}
+
+impl Clone for CommandLogger {
+    fn clone(&self) -> Self {
+        Self {
+            cmd_buffer: self.cmd_buffer.clone(),
+        }
+    }
+}
 
 /// 命令执行器接口，负责命令的实际执行
 #[async_trait]
@@ -188,6 +262,8 @@ pub struct CommandHandler {
     channel_communicator_factory: Arc<dyn Fn(Handle) -> Arc<dyn ChannelCommunicator> + Send + Sync>,
     // 使用单个会话而不是哈希表
     pty_session: Arc<tokio::sync::Mutex<Option<PtySession>>>,
+    // 命令日志记录器
+    cmd_logger: CommandLogger,
 }
 
 impl Default for CommandHandler {
@@ -198,6 +274,7 @@ impl Default for CommandHandler {
                 Arc::new(SshChannelCommunicator::new(handle))
             }),
             pty_session: Arc::new(tokio::sync::Mutex::new(None)),
+            cmd_logger: CommandLogger::new(),
         }
     }
 }
@@ -213,6 +290,7 @@ impl CommandHandler {
             command_executor,
             channel_communicator_factory,
             pty_session: Arc::new(tokio::sync::Mutex::new(None)),
+            cmd_logger: CommandLogger::new(),
         }
     }
     
@@ -391,6 +469,9 @@ impl CommandHandler {
         data: &[u8],
         _session_handle: Handle,
     ) -> Result<(), anyhow::Error> {
+        // 使用命令日志记录器处理用户输入
+        self.cmd_logger.process_input(_channel_id, data).await;
+        
         // 获取会话
         let mut session_lock = self.pty_session.lock().await;
         
@@ -419,7 +500,8 @@ impl CommandHandler {
     
     /// 执行单个命令并通过SSH通道返回结果
     pub async fn execute_command(&self, command: String, channel_id: ChannelId, session_handle: Handle) -> Result<(), anyhow::Error> {
-        info!("执行命令: {}", command);
+        // 使用命令日志记录器记录执行的命令
+        CommandLogger::log_command(channel_id, &command);
         
         // 使用策略模式创建通信器
         let communicator = (self.channel_communicator_factory)(session_handle.clone());
@@ -535,6 +617,7 @@ impl Clone for CommandHandler {
             command_executor: self.command_executor.clone(),
             channel_communicator_factory: self.channel_communicator_factory.clone(),
             pty_session: self.pty_session.clone(),
+            cmd_logger: self.cmd_logger.clone(),
         }
     }
 }

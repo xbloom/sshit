@@ -5,7 +5,7 @@ use std::time::Instant;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use tokio::sync::Mutex;
 use russh::server::{Auth, Msg, Server, Session};
 use russh::{Channel, ChannelId, Pty};
@@ -441,7 +441,7 @@ impl russh::server::Handler for SshServer {
     }
     
     async fn data(&mut self, channel: ChannelId, data: &[u8], _session: &mut Session) -> Result<(), Self::Error> {
-        debug!("在通道 {} 上收到数据: {:?}", channel, data);
+        tracing::trace!("在通道 {} 上收到数据: {:?}", channel, data);
         
         // 获取会话信息
         if let Some(session_info) = self.get_session().await {
