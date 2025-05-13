@@ -8,6 +8,7 @@ mod key_manager;
 mod ssh_client;
 mod ssh_server;
 mod command_handler;
+mod sftp_handler;
 
 use key_manager::{KeyManager, SshKeyType};
 use ssh_client::SshClient;
@@ -70,6 +71,10 @@ struct Args {
     /// SSH 服务器默认密码
     #[clap(long, default_value = "password")]
     server_password: String,
+    
+    /// SFTP 子系统的工作目录，默认为当前目录
+    #[clap(long)]
+    sftp_root_dir: Option<String>,
 }
 
 #[tokio::main]
@@ -151,6 +156,7 @@ async fn main() -> Result<()> {
             key_path: None, // 我们会生成一个随机密钥
             default_username: args.server_username.clone(),
             default_password: args.server_password.clone(),
+            sftp_root_dir: args.sftp_root_dir.clone(),
         }
     );
     

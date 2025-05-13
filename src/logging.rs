@@ -47,8 +47,40 @@ where
         }
         write!(writer, " ")?;
 
-        // 格式化目标（更淡的紫色）
-        // write!(writer, "\x1b[38;5;189m[{}]\x1b[0m ", metadata.target())?;  // 更淡的紫色，不固定宽度
+        // 获取并显示span上下文信息 - 使用淡青色显示
+        if let Some(span) = ctx.lookup_current() {
+            let mut span_color = "\x1b[38;5;116m"; // 淡青色
+            write!(writer, "[")?;
+            
+            // 获取span名称并显示
+            let name = span.name();
+            if !name.is_empty() {
+                write!(writer, "{}{}\x1b[0m", span_color, name)?;
+            }
+            
+            // 遍历span中的扩展数据，显示会话ID和通道ID等
+            let mut extensions = span.extensions_mut();
+            if let Some(fields) = extensions.get_mut::<fmt::FormattedFields<N>>() {
+                if !fields.fields.is_empty() {
+                    if !name.is_empty() {
+                        write!(writer, " ")?;
+                    }
+                    span_color = "\x1b[38;5;159m"; // 换个颜色区分字段
+                    write!(writer, "{}{}\x1b[0m", span_color, fields.fields)?;
+                }
+            }
+            // 在访问完extensions后，释放对span的可变借用
+            drop(extensions);
+            
+            // 添加上级span的信息 - 不修改当前span的引用
+            let parent_span_info = get_parent_info(&span);
+            if !parent_span_info.is_empty() {
+                span_color = "\x1b[38;5;110m"; // 更淡的蓝色表示父span
+                write!(writer, " <- {}{}\x1b[0m", span_color, parent_span_info)?;
+            }
+            
+            write!(writer, "] ")?;
+        }
 
         // 格式化文件名和行号 - 淡蓝色
         if let Some(file) = metadata.file() {
@@ -119,6 +151,37 @@ where
         write!(writer, "{}", formatted)?;
         writeln!(writer)
     }
+}
+
+// 添加一个辅助函数来获取父span的信息
+fn get_parent_info<S>(span: &tracing_subscriber::registry::SpanRef<'_, S>) -> String 
+where 
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    let mut result = String::new();
+    let current = span; // 使用引用而不是克隆
+    
+    // 获取第一个父span
+    if let Some(parent) = current.parent() {
+        let mut current_parent = parent;
+        loop {
+            let parent_name = current_parent.name();
+            if !parent_name.is_empty() {
+                if !result.is_empty() {
+                    result.push_str(" <- ");
+                }
+                result.push_str(parent_name);
+            }
+            
+            // 尝试获取下一个父span
+            match current_parent.parent() {
+                Some(next_parent) => current_parent = next_parent,
+                None => break,
+            }
+        }
+    }
+    
+    result
 }
 
 /// 日志系统初始化函数

@@ -130,37 +130,16 @@ pub struct DefaultCommandExecutor;
 #[async_trait]
 impl CommandExecutor for DefaultCommandExecutor {
     async fn execute_command(&self, command: &str) -> Result<Child, anyhow::Error> {
-        // 检查是否是SCP命令，需要特殊处理
-        let is_scp = command.starts_with("scp ");
+        // 普通命令
+        Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("无法启动命令: {}", e))
         
-        if is_scp {
-            tracing::info!("执行SCP命令: {}", command);
-            
-            // 创建一个更详细的日志，帮助调试SCP问题
-            let command_parts: Vec<&str> = command.split_whitespace().collect();
-            tracing::info!("SCP命令参数: {:?}", command_parts);
-            
-            // SCP命令需要标准输入输出，确保它们都被正确配置
-            Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .stdin(Stdio::piped())  // 确保标准输入可用
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .env("SSH_ORIGINAL_COMMAND", command) // 添加环境变量，有时SCP需要
-                .spawn()
-                .map_err(|e| anyhow::anyhow!("无法启动SCP命令: {}", e))
-        } else {
-            // 普通命令
-            Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| anyhow::anyhow!("无法启动命令: {}", e))
-        }
     }
     
     async fn start_shell_with_pty(&self, term: &str, cols: u32, rows: u32) -> Result<(Arc<StdMutex<Box<dyn MasterPty + Send>>>, Box<dyn PtyChild + Send>), anyhow::Error> {
@@ -524,12 +503,19 @@ impl CommandHandler {
         let communicator = (self.channel_communicator_factory)(session_handle.clone());
         
         // 启动一个基本的shell进程，但不使用PTY
-        // 我们直接使用bash -s，这样它会接受标准输入但不会尝试使用交互式功能
-        let mut child = Command::new("bash")
+        // 我们直接使用bash -s，这样它会接受标准输入但不会尝试使用交互式功
+        
+        let mut child = tokio::process::Command::new("bash")
             .arg("-s")  // 从标准输入读取命令
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .arg("--")  // 标记参数结束，后续内容作为脚本输入
+            // 设置环境变量以改善非交互式体验
+            .env("PS1", "$ ")  // 简单的提示符
+            .env("TERM", "dumb")  // 简单的终端类型
+            .env("SHELL", "/bin/bash")  // 确保shell类型正确
+            .env("LANG", "C.UTF-8")  // 设置UTF-8编码
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| anyhow::anyhow!("无法启动非交互式shell: {}", e))?;
         
@@ -607,8 +593,8 @@ impl CommandHandler {
             *handler_lock = Some(Arc::new(handle_input));
             
             // 通知客户端我们已准备好接收命令
-            let welcome_msg = "Connected to non-interactive shell. PTY features are not available.\r\n";
-            let _ = communicator.send_data(channel_id, welcome_msg.as_bytes()).await;
+            // let welcome_msg = "Connected to non-interactive shell. PTY features are not available.\r\n";
+            // let _ = communicator.send_data(channel_id, welcome_msg.as_bytes()).await;
         }
         
         Ok(())
@@ -654,7 +640,7 @@ impl CommandHandler {
             } else {
                 // 对于非交互式会话，没有PTY，但我们仍然需要处理输入
                 // 记录收到的数据用于调试
-                tracing::debug!(
+                tracing::warn!(
                     channel_id = ?channel_id,
                     data_len = data.len(),
                     data = ?String::from_utf8_lossy(data),
@@ -687,18 +673,6 @@ impl CommandHandler {
     pub async fn execute_command(&self, command: String, channel_id: ChannelId, session_handle: Handle) -> Result<(), anyhow::Error> {
         // 使用命令日志记录器记录执行的命令
         CommandLogger::log_command(channel_id, &command);
-        
-        // 检查是否是SCP命令，SCP需要特殊处理
-        let is_scp = command.starts_with("scp ") || command.contains("/scp ") || 
-                      command.contains(" -t ") || command.contains(" -f ");
-        
-        if is_scp {
-            tracing::info!(
-                channel_id = ?channel_id,
-                command = %command,
-                "执行SCP命令"
-            );
-        }
         
         // 使用策略模式创建通信器
         let communicator = (self.channel_communicator_factory)(session_handle.clone());

@@ -13,6 +13,7 @@ async fn main() -> anyhow::Result<()> {
         key_path: None, // 使用随机生成的密钥
         default_username: "admin".to_string(),
         default_password: "password".to_string(),
+        sftp_root_dir: None, // 添加sftp_root_dir字段
     };
     
     // 记录服务器配置信息
