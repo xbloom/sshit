@@ -167,6 +167,9 @@ async fn main() -> Result<()> {
     println!("使用以下命令连接到您的内部机器：");
     println!("ssh -p {} {}@{}", remote_proxy_port, args.server_username, args.remote_host);
     println!("默认密码: {}", args.server_password);
+    println!("\n您也可以使用动态端口转发（SOCKS5代理）：");
+    println!("ssh -p {} -D 33064 {}@{}", remote_proxy_port, args.server_username, args.remote_host);
+    println!("然后配置您的浏览器使用 SOCKS5 代理 (127.0.0.1:33064)");
     
     tracing::info!(
         remote_port = remote_proxy_port,

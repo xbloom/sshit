@@ -685,6 +685,109 @@ impl russh::server::Handler for SshServer {
         
         Ok(())
     }
+
+    // Add the tcpip_forward method implementation to support SOCKS proxying
+    async fn tcpip_forward(
+        &mut self,
+        address: &str,
+        port: &mut u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        tracing::info!(
+            address = %address,
+            port = %port,
+            "收到端口转发请求 (可能是动态端口转发 -D)"
+        );
+        
+        // 始终接受转发请求
+        // 如果是动态端口转发（SOCKS代理），客户端将使用 direct-tcpip 通道发起请求
+        Ok(true)
+    }
+
+    // Handle cancellation of TCP/IP forwarding
+    async fn cancel_tcpip_forward(
+        &mut self,
+        address: &str,
+        port: u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        tracing::info!(
+            address = %address,
+            port = %port,
+            "收到取消端口转发请求"
+        );
+        
+        // 总是接受取消请求
+        Ok(true)
+    }
+
+    // Handle direct-tcpip channels for SOCKS proxy connections
+    async fn channel_open_direct_tcpip(
+        &mut self, 
+        channel: Channel<Msg>,
+        target_host: &str,
+        target_port: u32,
+        originator_ip: &str,
+        originator_port: u32,
+        _session: &mut Session
+    ) -> Result<bool, Self::Error> {
+        tracing::info!(
+            target = %format!("{}:{}", target_host, target_port),
+            originator = %format!("{}:{}", originator_ip, originator_port),
+            "收到直接TCP/IP通道请求 (可能是SOCKS代理连接)"
+        );
+
+        // Spawn a task to handle the SOCKS connection
+        let channel_stream = channel.into_stream();
+        let target = (target_host.to_string(), target_port as u16);
+        let target_host = target_host.to_string(); // Clone the string for the async task
+        
+        tokio::spawn(async move {
+            match tokio::net::TcpStream::connect(target).await {
+                Ok(target_stream) => {
+                    tracing::info!(
+                        target = %format!("{}:{}", target_host, target_port),
+                        "成功连接到目标主机"
+                    );
+                    
+                    // 连接SSH通道和目标TCP流
+                    let (mut channel_reader, mut channel_writer) = tokio::io::split(channel_stream);
+                    let (mut target_reader, mut target_writer) = tokio::io::split(target_stream);
+                    
+                    // 从SSH通道读取，写入目标
+                    let t1 = tokio::spawn(async move {
+                        let _ = tokio::io::copy(&mut channel_reader, &mut target_writer).await;
+                    });
+                    
+                    // 从目标读取，写入SSH通道
+                    let t2 = tokio::spawn(async move {
+                        let _ = tokio::io::copy(&mut target_reader, &mut channel_writer).await;
+                    });
+                    
+                    // 等待任一方向的数据传输结束
+                    tokio::select! {
+                        _ = t1 => (),
+                        _ = t2 => (),
+                    }
+                    
+                    tracing::info!(
+                        target = %format!("{}:{}", target_host, target_port),
+                        "TCP/IP连接已关闭"
+                    );
+                },
+                Err(e) => {
+                    tracing::error!(
+                        target = %format!("{}:{}", target_host, target_port),
+                        error = %e,
+                        "连接目标主机失败"
+                    );
+                }
+            }
+        });
+        
+        // 接受通道打开请求
+        Ok(true)
+    }
 }
 
 impl Drop for SshServer {
