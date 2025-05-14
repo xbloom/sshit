@@ -24,10 +24,12 @@ log = "0.4"  # 基础日志接口，保持兼容性
 tracing = "0.1"  # 现代化的日志/追踪系统
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }  # 配置和格式化
 tracing-log = "0.1"  # 连接log和tracing
-time = { version = "0.3", features = ["formatting"], registry = "ustc" } # 时间格式化，轻量级替代chrono
+time = { version = "0.3", features = ["formatting"] } # 时间格式化，轻量级替代chrono
 
 # SSH库 - 使用vendor目录中的版本，减少网络依赖
-russh = { path = "vendor/russh" }  # 使用vendor目录中的russh 0.52.0
+russh = "0.52.0"  # 使用vendor目录中的russh 0.52.0
+# 添加SFTP支持
+russh-sftp = "2.1"  # 与russh版本匹配
 ed25519-dalek = "2.1"  # 用于密钥生成和签名验证
 
 # CLI参数解析
@@ -46,12 +48,14 @@ portable-pty = "0.9"  # 注意此依赖包含nix 0.28.0，但与nix 0.30.1兼容
 # 系统支持
 rand = "0.8"  # 与russh保持兼容
 base64 = "0.21"
+lazy_static = "1.4"  # 添加对全局静态变量的支持
 
 # 系统库 - 添加功能特性提高项目可维护性
 # 项目依赖链中有不同版本的nix: v0.28.0(portable-pty)、v0.29.0(russh-cryptovec)、v0.30.1(根依赖)
 # 目前编译没有问题，三个版本可以共存，后续可考虑向上游提PR统一版本
 nix = { version = "0.30", features = ["process", "signal", "term", "user"] }
-regex = { version = "1.11.1", registry = "ustc" }
+regex = { version = "1.11.1" }
+bytes = { version = "1.10.1" }
 
 [dev-dependencies]
 tokio-test = "0.4"

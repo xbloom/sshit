@@ -1,0 +1,19 @@
+# 排除Git相关文件
+.git
+.gitignore
+
+# 排除构建目录和依赖
+/target
+.cargo-cache
+
+# 排除不需要的文件
+**/*.rs.bk
+*.pdb
+*.swp
+*.swo
+.DS_Store
+
+# 排除开发相关文件
+.idea
+.vscode
+*.iml 
