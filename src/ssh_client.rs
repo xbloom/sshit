@@ -1,20 +1,93 @@
 use anyhow::{Result, anyhow};
-use log::{info, error};
-use ssh2::Session;
-use std::net::TcpStream;
+use tracing::{info, error, debug, trace};
 use std::path::PathBuf;
-use std::io::{Read, Write};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use russh::*;
+use russh::client;
+use russh::client::Handle;
+use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
 
-use crate::ssh_server::SshServer;
+use crate::try_log;
 
+// SSH 客户端处理程序
+struct ClientHandler {
+    local_host: String,
+    local_port: u16,
+}
+
+impl ClientHandler {
+    fn new(local_host: String, local_port: u16) -> Self {
+        Self {
+            local_host,
+            local_port,
+        }
+    }
+}
+
+// 实现 russh 的客户端处理程序特质
+impl client::Handler for ClientHandler {
+    type Error = russh::Error;
+    
+    // 校验服务器公钥 (简化版，实际应用中应当记住并验证远程主机的指纹)
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &russh::keys::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        // 在实际应用中，应该验证服务器密钥以防止中间人攻击
+        debug!("收到服务器公钥校验请求");
+        // 简单起见，这里总是返回 true
+        Ok(true)
+    }
+    
+    // 处理从远程服务器打开的转发连接
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        originator_port: u32,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        info!("收到远程转发连接: {}:{} -> {}:{} (来自 {}:{})",
+              connected_address, connected_port, self.local_host, self.local_port, 
+              originator_address, originator_port);
+        
+        // 启动新任务处理这个连接
+        let local_host = self.local_host.clone();
+        let local_port = self.local_port;
+        
+        tokio::spawn(async move {
+            // 连接到本地 SSH 服务器
+            match TcpStream::connect(format!("{}:{}", local_host, local_port)).await {
+                Ok(local_stream) => {
+                    if let Err(e) = handle_forwarded_connection(channel, local_stream).await {
+                        error!("处理转发连接失败: {}", e);
+                    }
+                },
+                Err(e) => {
+                    error!("连接本地 SSH 服务器失败: {}", e);
+                    // 关闭通道，向客户端报告错误
+                    if let Err(e) = channel.close().await {
+                        error!("关闭通道失败: {}", e);
+                    }
+                }
+            }
+        });
+        
+        Ok(())
+    }
+}
+
+// 为 R-SSH 客户端提供一个便于使用的包装
 pub struct SshClient {
     host: String,
     port: u16,
     username: String,
     key_path: PathBuf,
-    session: Option<Arc<Mutex<Session>>>,
+    session: Option<Handle<ClientHandler>>,
 }
 
 impl SshClient {
@@ -28,262 +101,185 @@ impl SshClient {
         }
     }
 
-    pub async fn connect(&mut self) -> Result<()> {
-        // Connect to the remote server
-        info!("正在连接远程服务器 {}:{} 用户名: '{}'", self.host, self.port, self.username);
-        let tcp = match TcpStream::connect(format!("{}:{}", self.host, self.port)) {
-            Ok(stream) => stream,
+    // New combined method that connects and sets up port forwarding in one step
+    pub async fn connect_and_forward(&mut self, remote_port: u16, to_host: String, to_port: u16) -> Result<()> {
+        
+        // Create connection handler with the correct local host information directly
+        let handler = ClientHandler::new(to_host.clone(), to_port);
+        
+        // 加载私钥
+        info!("正在加载密钥 {:?}", self.key_path);
+        let start = std::time::Instant::now();
+        let key_pair = match load_secret_key(&self.key_path, None) {
+            Ok(key) => {
+                debug!("密钥加载完成，耗时 {:?}", start.elapsed());
+                key
+            },
             Err(e) => {
-                error!("连接远程服务器 {}:{} 失败: {}", self.host, self.port, e);
-                return Err(anyhow!("TCP 连接失败: {}", e));
+                error!("加载密钥失败: {}", e);
+                return Err(anyhow!("加载密钥失败: {}", e));
             }
         };
         
-        // Create a new SSH session
-        let mut sess = Session::new()?;
-        sess.set_tcp_stream(tcp);
+        // 创建默认的 SSH 客户端配置
+        let config_client = client::Config::default();
+        trace!("SSH客户端配置详情: {:?}", config_client);
+        let config_client = Arc::new(config_client);
         
-        info!("开始 SSH 握手");
-        if let Err(e) = sess.handshake() {
-            error!("SSH 握手失败: {}", e);
-            return Err(anyhow!("SSH 握手失败: {}", e));
-        }
-        info!("SSH 握手成功完成");
+        // 连接到远程 SSH 服务器
+        info!("正在连接远程服务器 {}:{} 使用用户名: '{}'", self.host, self.port, self.username);
+        let server_address = format!("{}:{}", self.host, self.port);
         
-        // Log the key paths and verify they exist
-        let private_key = &self.key_path;
-        let public_key = self.key_path.with_extension("pub");
+        // 建立 SSH 连接
+        let mut session = client::connect(config_client, server_address, handler).await
+            .map_err(|e| anyhow!("连接服务器失败: {}", e))?;
         
-        info!("使用私钥文件: {:?}", private_key);
-        if !private_key.exists() {
-            error!("私钥文件未找到: {:?}", private_key);
-            return Err(anyhow!("私钥文件未找到: {:?}", private_key));
-        }
-        
-        info!("使用公钥文件: {:?}", public_key);
-        if !public_key.exists() {
-            error!("公钥文件未找到: {:?}", public_key);
-            return Err(anyhow!("公钥文件未找到: {:?}", public_key));
-        }
-        
-        // Authenticate with the private key
-        info!("正在尝试使用密钥对用户 '{}' 进行认证", self.username);
-        match sess.userauth_pubkey_file(
-            &self.username,
-            Some(&public_key),
-            private_key,
-            None,
-        ) {
-            Ok(_) => info!("密钥认证成功"),
-            Err(e) => {
-                error!("密钥认证失败: {}", e);
-                return Err(anyhow!("SSH 密钥认证失败: {}。请确保已将公钥添加到用户 {} 的 authorized_keys 文件中", e, self.username));
-            }
-        }
-        
-        if !sess.authenticated() {
-            error!("SSH 会话未认证，即使没有报告错误");
-            return Err(anyhow!("SSH 认证失败: 会话未认证"));
-        }
-        
-        info!("成功连接到 {}:{}", self.host, self.port);
-        self.session = Some(Arc::new(Mutex::new(sess)));
-        
-        Ok(())
-    }
+        debug!("TCP连接建立成功 - 总耗时: {:?}", start.elapsed());
+        // 认证（只认证一次）
+        info!("正在使用密钥进行认证...");
+        debug!("开始密钥认证 - {}", std::time::Instant::now().elapsed().as_secs_f32());
+        let key_arc = Arc::new(key_pair);
+        let hash_alg = session.best_supported_rsa_hash().await.ok()
+            .and_then(|alg: Option<Option<keys::HashAlg>>| { alg.flatten() });
 
-    pub async fn forward_remote_port(&self, remote_port: u16, ssh_server: SshServer, remote_host: String) -> Result<()> {
-        if self.session.is_none() {
-            return Err(anyhow!("未连接到 SSH 服务器"));
+        let key_with_hash = PrivateKeyWithHashAlg::new(key_arc, hash_alg);
+        
+        debug!("发送认证请求 - {}", std::time::Instant::now().elapsed().as_secs_f32());
+        // 认证流程，只有关键日志
+        let auth_result = try_log!(
+            session.authenticate_publickey(self.username.clone(), key_with_hash).await,
+            "认证失败"
+        )?;
+        
+        if !auth_result.success() {
+            error!("密钥认证被拒绝");
+            return Err(anyhow!("SSH 密钥认证失败，请检查配置"));
         }
+        info!("身份验证成功");
 
-        let session_arc = self.session.as_ref().unwrap().clone();
+        self.session = Some(session);
         
-        // 获取会话的互斥锁
-        let session = session_arc.lock().await;
+        // 设置远程端口转发
+        let session = self.session.as_mut().unwrap();
+        let bind_address = "0.0.0.0";
         
-        // 从 SshServer 获取配置
-        let local_host = &ssh_server.config.listen_addr;
-        let local_port = ssh_server.config.listen_port;
-        
-        // 设置远程端口转发 (remote_port 将在远程机器上开放，转发到本地 SSH 服务器)
-        info!("正在尝试设置远程端口转发: {}:{} -> {}:{}", 
-              remote_host, remote_port, local_host, local_port);
-              
-        // 使用正确的 SSH2 API 设置远程转发
-        match session.channel_forward_listen(remote_port, Some(local_host), None) {
-            Ok((mut listener, actual_port)) => {
-                info!("远程端口转发成功设置: {}:{} -> {}:{}, 实际端口: {}", 
-                      remote_host, remote_port, local_host, local_port, actual_port);
-                
-                // 释放锁，以便后续操作可以获取锁
-                drop(session);
-                
-                // 启动处理转发连接的后台任务
-                let session_for_accept = session_arc.clone();
-                let ssh_server_clone = ssh_server.clone();
-                
-                // 创建一个专门处理转发连接的任务
-                tokio::spawn(async move {
-                    // 使用阻塞任务处理 SSH2 库的阻塞操作
-                    tokio::task::spawn_blocking(move || {
-                        // 获取阻塞模式的会话 (我们只需要 listener，实际上不需要使用会话)
-                        let _session = session_for_accept.blocking_lock();
-                        
-                        // 获取本地主机和端口
-                        let local_host = &ssh_server_clone.config.listen_addr;
-                        let local_port = ssh_server_clone.config.listen_port;
-                        
-                        // 不断接受连接
-                        loop {
-                            // 阻塞接受连接
-                            match listener.accept() {
-                                Ok(mut channel) => {
-                                    info!("接受到一个转发连接");
-                                    
-                                    // 为每个连接创建一个新的处理流程
-                                    let local_host = local_host.clone();
-                                    let local_port = local_port;
-                                    
-                                    // 连接到本地 SSH 服务器
-                                    match TcpStream::connect(format!("{}:{}", local_host, local_port)) {
-                                        Ok(mut local_stream) => {
-                                            // 配置通道
-                                            channel.handle_extended_data(ssh2::ExtendedData::Merge).unwrap_or_else(|e| {
-                                                error!("设置扩展数据处理失败: {}", e);
-                                            });
-                                            
-                                            // 建立双向数据流
-                                            std::thread::spawn(move || {
-                                                // 标准输入输出模式，自动处理数据传输
-                                                if channel.request_pty("xterm", None, None).is_ok() {
-                                                    info!("连接已建立，正在转发数据");
-                                                    
-                                                    // 使用简单的 IO 复制来处理数据传输
-                                                    let mut buffer = [0; 8192];
-                                                    loop {
-                                                        // 从通道读取数据并写入本地流
-                                                        match channel.read(&mut buffer) {
-                                                            Ok(0) => break, // EOF
-                                                            Ok(n) => {
-                                                                if local_stream.write_all(&buffer[..n]).is_err() {
-                                                                    break;
-                                                                }
-                                                            }
-                                                            Err(_) => break,
-                                                        }
-                                                        
-                                                        // 从本地流读取数据并写入通道
-                                                        match local_stream.read(&mut buffer) {
-                                                            Ok(0) => break, // EOF
-                                                            Ok(n) => {
-                                                                if channel.write_all(&buffer[..n]).is_err() {
-                                                                    break;
-                                                                }
-                                                            }
-                                                            Err(_) => break,
-                                                        }
-                                                    }
-                                                }
-                                            });
-                                        },
-                                        Err(e) => {
-                                            error!("连接本地 SSH 服务器失败: {}", e);
-                                        }
-                                    }
-                                },
-                                Err(e) => {
-                                    // 检查是否是连接超时
-                                    error!("接受转发连接失败: {}", e);
-                                    if e.to_string().contains("timeout") {
-                                        continue;
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                });
-            },
-            Err(e) => {
+        info!("正在设置远程端口转发: {}:{} -> {}:{}", bind_address, remote_port, to_host, to_port);
+        // 发送 tcpip-forward 请求
+        debug!("开始设置端口转发 - {}", std::time::Instant::now().elapsed().as_secs_f32());
+        let forward_start = std::time::Instant::now();
+ 
+        // 尝试设置端口转发并处理结果
+        let port = session.tcpip_forward(bind_address, remote_port as u32).await
+            .map_err(|e| {
                 error!("设置远程端口转发失败: {}", e);
-                return Err(anyhow!("设置远程端口转发失败: {}", e));
-            }
-        }
+                anyhow!("设置远程端口转发失败: {}", e)
+            })?;
+            
+        debug!("端口转发设置成功 - 耗时: {:?}", forward_start.elapsed());
         
-        // 保持会话活跃以维持端口转发
+        // 确定实际使用的端口号（如果返回0，则使用请求的端口）
+        let actual_port = if port == 0 { remote_port as u32 } else { port };
+        info!("远程端口转发成功建立，端口: {}", actual_port);
+        
+        // 获取session的所有权用于保活线程
+        let session_handle = self.session.take().unwrap();
         tokio::spawn(async move {
-            // 定期发送保活消息以保持 SSH 会话活跃
-            let keep_alive_interval = tokio::time::Duration::from_secs(60);
+            let keep_alive_interval = std::time::Duration::from_secs(60);
             loop {
                 tokio::time::sleep(keep_alive_interval).await;
-                let lock = session_arc.lock().await;
-                // 设置 keepalive（这是一个设置方法，返回 void）
-                if let Err(e) = std::io::Result::Ok(lock.set_keepalive(true, 30)) {
-                    error!("设置保活消息失败: {}", e);
+                if let Err(e) = session_handle.send_keepalive(false).await {
+                    error!("发送保活消息失败: {}", e);
                     break;
                 }
+                debug!("发送保活消息");
             }
         });
         
-        info!("端口转发已建立: {}:{} -> 本地 SSH 服务器 {}:{}", 
-              remote_host, remote_port, local_host, local_port);
-        
+        info!("端口转发已建立: 远程 SERVER:{} -> 本地 SSH 服务器 {}:{}", 
+               actual_port, to_host, to_port);
+              
         Ok(())
     }
 }
 
-// 此函数在新的实现中不再需要，保留为注释以防将来需要
-/*
-async fn handle_connection(
-    remote_stream: tokio::net::TcpStream,
-    ssh_server: SshServer,
-    _session: Arc<Mutex<Session>>,
+// 处理一个转发连接，在 SSH 通道和本地 TCP 流之间复制数据
+async fn handle_forwarded_connection(
+    channel: Channel<client::Msg>,
+    local_stream: TcpStream,
 ) -> Result<()> {
-    // Connect to the local SSH server
-    let local_stream = ssh_server.connect().await?;
+    // 创建异步读取器和写入器
+    let (local_reader, local_writer) = tokio::io::split(local_stream);
     
-    // 创建双向拷贝的任务
-    let (mut remote_reader, mut remote_writer) = tokio::io::split(remote_stream);
-    let (mut local_reader, mut local_writer) = tokio::io::split(local_stream);
+    // 将通道拆分为读和写两部分
+    let (mut channel_read, channel_write) = channel.split();
     
-    // Create two tasks for bidirectional copying
-    let client_to_server = tokio::spawn(async move {
-        let mut buffer = vec![0; 8192];
+    // 从 SSH 通道读取，写入本地连接
+    let ssh_to_local_fut = async {
+        let mut local_writer = local_writer;
         loop {
-            match remote_reader.read(&mut buffer).await {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    if local_writer.write_all(&buffer[..n]).await.is_err() {
+            match channel_read.wait().await {
+                Some(ChannelMsg::Data { ref data }) => {
+                    if let Err(e) = local_writer.write_all(data).await {
+                        error!("写入数据到本地连接失败: {}", e);
                         break;
                     }
-                }
-                Err(_) => break,
+                },
+                Some(ChannelMsg::Eof) => {
+                    debug!("SSH 通道发送了 EOF");
+                    break;
+                },
+                Some(ChannelMsg::Close) => {
+                    debug!("SSH 通道已关闭");
+                    break;
+                },
+                None => {
+                    debug!("SSH 通道已结束");
+                    break;
+                },
+                _ => {} // 忽略其他消息
             }
         }
-    });
+    };
     
-    let server_to_client = tokio::spawn(async move {
-        let mut buffer = vec![0; 8192];
+    // 从本地连接读取，写入 SSH 通道
+    let local_to_ssh_fut = async {
+        let mut local_reader = local_reader;
+        let channel_write = channel_write;
+        let mut buffer = [0u8; 16384];
+        
         loop {
             match local_reader.read(&mut buffer).await {
-                Ok(0) => break, // EOF
+                Ok(0) => {
+                    debug!("本地连接已关闭");
+                    if let Err(e) = channel_write.eof().await {
+                        error!("发送 EOF 失败: {}", e);
+                    }
+                    break;
+                },
                 Ok(n) => {
-                    if remote_writer.write_all(&buffer[..n]).await.is_err() {
+                    if let Err(e) = channel_write.data(&buffer[..n]).await {
+                        error!("发送数据到 SSH 通道失败: {}", e);
                         break;
                     }
+                },
+                Err(e) => {
+                    error!("从本地连接读取失败: {}", e);
+                    break;
                 }
-                Err(_) => break,
             }
         }
-    });
+        
+        // 确保通道关闭
+        if let Err(e) = channel_write.close().await {
+            error!("关闭通道失败: {}", e);
+        }
+    };
     
-    // Wait for either direction to complete
+    // 等待任一任务完成，直接使用 futures 而不是 JoinHandle
     tokio::select! {
-        _ = client_to_server => {},
-        _ = server_to_client => {},
+        _ = ssh_to_local_fut => debug!("SSH->本地 数据传输结束"),
+        _ = local_to_ssh_fut => debug!("本地->SSH 数据传输结束"),
     }
     
     Ok(())
-}
-*/ 
+} 

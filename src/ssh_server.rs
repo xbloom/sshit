@@ -230,10 +230,10 @@ impl russh::server::Handler for SshServer {
         tracing::info!("用户尝试无密码认证");
         
         // Only accept if username matches the default
-        if user == self.config.default_username {
-            tracing::info!("无密码认证成功");
-            return Ok(Auth::Accept);
-        }
+        // if user == self.config.default_username {
+        //     tracing::info!("无密码认证成功");
+        //     return Ok(Auth::Accept);
+        // }
         
         tracing::warn!("无密码认证被拒绝");
         Ok(Auth::reject())

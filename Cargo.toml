@@ -12,6 +12,7 @@ name = "ssh_server_example"
 path = "examples/ssh_server_example.rs"
 
 [dependencies]
+
 # 核心异步运行时 - 更新到最新稳定版本，提供完整功能
 tokio = { version = "1.45", features = ["full"] }
 
@@ -27,7 +28,8 @@ tracing-log = "0.1"  # 连接log和tracing
 time = { version = "0.3", features = ["formatting"] } # 时间格式化，轻量级替代chrono
 
 # SSH库 - 使用vendor目录中的版本，减少网络依赖
-russh = "0.52.0"  # 使用vendor目录中的russh 0.52.0
+# russh = { path = "vendor/russh" }  # 使用vendor目录中的russh 0.52.0
+russh = "0.52.0"
 # 添加SFTP支持
 russh-sftp = "2.1"  # 与russh版本匹配
 ed25519-dalek = "2.1"  # 用于密钥生成和签名验证
@@ -46,7 +48,7 @@ ssh2 = "0.9"
 portable-pty = "0.9"  # 注意此依赖包含nix 0.28.0，但与nix 0.30.1兼容
 
 # 系统支持
-rand = "0.8"  # 与russh保持兼容
+rand = { version = "0.8"  }  # 与russh保持兼容
 base64 = "0.21"
 lazy_static = "1.4"  # 添加对全局静态变量的支持
 

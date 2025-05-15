@@ -215,10 +215,23 @@ pub fn setup_logging(default_level: Level, app_name: &str) {
         // 从环境变量设置日志级别，默认指定的级别
         let filter = EnvFilter::try_from_env(env_name)
             .unwrap_or_else(|_| {
-                // ssh_proxy=debug 意味着我们的代码使用DEBUG级别，依赖库使用默认级别
-                // 添加russh=warn来过滤掉russh库的调试日志
-                EnvFilter::new(format!("{},ssh_proxy={},russh=warn", default_directive, default_directive))
+                // 检查是否已通过RUST_LOG设置了日志级别
+                match std::env::var("RUST_LOG") {
+                    Ok(rust_log) => {
+                        // 如果设置了RUST_LOG，使用它作为基础，但确保我们的包也有正确的日志级别
+                        let combined = format!("{},ssh_proxy={}", rust_log, default_directive);
+                        EnvFilter::new(combined)
+                    },
+                    Err(_) => {
+                        // 没有设置RUST_LOG，使用默认设置
+                        // ssh_proxy=debug 意味着我们的代码使用DEBUG级别，依赖库使用默认级别
+                        EnvFilter::new(format!("{},ssh_proxy={},russh=warn", default_directive, default_directive))
+                    }
+                }
             });
+        
+        // 检查是否应该启用自定义格式化器和彩色日志
+        let use_custom_formatter = std::env::var("COLORIZE_LOGS").is_ok();
         
         // 使用JSON格式作为可选，通过环境变量启用
         if std::env::var(format!("{}_JSON", app_name)).is_ok() {
@@ -234,12 +247,22 @@ pub fn setup_logging(default_level: Level, app_name: &str) {
         } else {
             // 必须先初始化LogTracer，确保log crate的消息能被正确处理
             if let Ok(()) = tracing_log::LogTracer::init() {
-                // 使用普通文本格式，但使用自定义格式化器只显示文件名
-                tracing_subscriber::registry()
-                    .with(filter)
-                    .with(fmt::layer().event_format(CustomFormatter).with_ansi(true))
-                    .try_init()
-                    .ok(); // 忽略可能的错误
+                // 根据环境变量选择是否使用自定义格式化器
+                if use_custom_formatter {
+                    // 使用自定义格式化器并启用彩色输出
+                    tracing_subscriber::registry()
+                        .with(filter)
+                        .with(fmt::layer().event_format(CustomFormatter).with_ansi(true))
+                        .try_init()
+                        .ok(); // 忽略可能的错误
+                } else {
+                    // 使用默认格式化器，简洁明了
+                    tracing_subscriber::registry()
+                        .with(filter)
+                        .with(fmt::layer().with_ansi(false))
+                        .try_init()
+                        .ok(); // 忽略可能的错误
+                }
             }
         }
         

@@ -1,6 +1,7 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use rand::Rng;
+use tokio::io::AsyncBufReadExt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -9,6 +10,7 @@ mod ssh_client;
 mod ssh_server;
 mod command_handler;
 mod sftp_handler;
+mod utils;
 
 use key_manager::{KeyManager, SshKeyType};
 use ssh_client::SshClient;
@@ -33,7 +35,7 @@ impl FromStr for SshKeyType {
 struct Args {
     /// 远程 SSH 服务器主机
     #[clap(short = 'H', long)]
-    remote_host: String,
+    remote_host: Option<String>,
 
     /// 远程 SSH 服务器端口
     #[clap(short = 'P', long, default_value = "22")]
@@ -44,7 +46,7 @@ struct Args {
     local_host: String,
 
     /// 要暴露的本地 SSH 服务器端口
-    #[clap(short = 'p', long, default_value = "22")]
+    #[clap(short = 'p', long, default_value = "2222")]
     local_port: u16,
 
     /// 存储或加载 SSH 密钥的路径
@@ -65,25 +67,53 @@ struct Args {
     use_existing_key: bool,
 
     /// SSH 服务器默认用户名
-    #[clap(long, default_value = "admin")]
+    #[clap(long, default_value = "nimda")]
     server_username: String,
 
-    /// SSH 服务器默认密码
-    #[clap(long, default_value = "password")]
-    server_password: String,
+    /// SSH 服务器密码（可选，如未指定则随机生成）
+    #[clap(long)]
+    server_password: Option<String>,
     
     /// SFTP 子系统的工作目录，默认为当前目录
     #[clap(long)]
     sftp_root_dir: Option<String>,
+    
+    /// 启用详细日志，用于调试连接问题
+    #[clap(short = 'v', long)]
+    verbose: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // 使用新的日志初始化函数，设置默认日志级别为INFO
-    setup_logging(tracing::Level::INFO, "SSH_PROXY");
-    
-    let args = Args::parse();
+/// 配置并启动日志系统
+fn setup_app_logging(verbose: bool) {
+    if verbose {
+        // 设置详细日志，尤其是开启russh库的debug级别日志
+        std::env::set_var("RUST_LOG", "russh=debug,russh_keys=debug");
+        // 使用新的日志初始化函数，设置默认日志级别为DEBUG
+        // 开启彩色日志
+        std::env::set_var("COLORIZE_LOGS", "1");
+        setup_logging(tracing::Level::DEBUG, "SSH_PROXY");
+        
+        tracing::info!("调试模式已开启，将显示详细的SSH连接日志");
+    } else {
+        // 使用新的日志初始化函数，设置默认日志级别为INFO
+        // 确保不使用彩色日志
+        std::env::remove_var("COLORIZE_LOGS");
+        setup_logging(tracing::Level::INFO, "SSH_PROXY");
+    }
+}
 
+/// 启动SSH服务器作为后台任务
+async fn start_ssh_server(config: SshServerConfig) {
+    let mut ssh_server = SshServer::new(config);
+    tokio::spawn(async move {
+        if let Err(e) = ssh_server.run().await {
+            tracing::error!("SSH服务器运行错误: {}", e);
+        }
+    });
+}
+
+/// 准备SSH密钥并显示公钥信息
+async fn prepare_ssh_key(args: &Args) -> Result<KeyManager> {
     // 使用span来跟踪关键操作
     let setup_span = tracing::info_span!("setup");
     let _setup_guard = setup_span.enter();
@@ -96,7 +126,8 @@ async fn main() -> Result<()> {
         "设置SSH密钥"
     );
     
-    let key_manager = KeyManager::new(&args.key_path, args.key_type, !args.use_existing_key)?;
+    let key_manager = KeyManager::new(&args.key_path, args.key_type, !args.use_existing_key)
+        .context("创建密钥管理器失败")?;
     
     // If using existing key, check if it exists
     if args.use_existing_key && !key_manager.key_files_exist() {
@@ -107,80 +138,204 @@ async fn main() -> Result<()> {
         ));
     }
     
-    key_manager.setup_keypair()?;
+    key_manager.setup_keypair().context("设置SSH密钥对失败")?;
     
     // Display the public key for user to configure on remote server
-    let pubkey = key_manager.get_public_key_string()?;
+    let pubkey = key_manager.get_public_key_string().context("获取公钥字符串失败")?;
     
-    println!("\n=== SSH 公钥 ===");
-    println!("{}", pubkey);
-    println!("请在远程服务器上为用户 {} 配置此密钥", args.user);
-    
+    tracing::info!("");
+    tracing::info!("    📜 ---【 SSH 公钥信息 】--- 📜");
+    tracing::info!("    │");
+    tracing::info!("    │  远程用户: '{}'", args.user);
+    tracing::info!("    │  公钥内容:");
+    tracing::info!("    │  ╭─────────────────────────────────────────────────╮");
+    tracing::info!("    │  │ {} │", pubkey);
+    tracing::info!("    │  ╰─────────────────────────────────────────────────╯");
     if !args.use_existing_key {
-        println!("这是一个一次性密钥，仅用于此会话。");
+        tracing::info!("    │  提示: 这是一个一次性密钥，仅用于当前会话。");
+    }
+    tracing::info!("    │");
+    tracing::info!("    📜 ------﹝请按上述信息配置远程服务器﹞------ 📜");
+
+    Ok(key_manager)
+}
+
+/// 等待用户输入或超时
+async fn wait_for_user_input() -> Result<()> {
+    tracing::info!("");
+    tracing::info!("    ⏳ >>> 请按【回车键】继续，或等待3秒后自动操作...");
+    
+    let mut line_buffer = String::new();
+    let mut stdin_reader = tokio::io::BufReader::new(tokio::io::stdin());
+
+    tokio::select! {
+        // Branch 1: Wait for a 3-second timeout.
+        _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {
+            tracing::info!("    ⏳ >>> 已超时，自动继续...");
+        }
+        // Branch 2: Wait for a line from stdin (or EOF).
+        result = stdin_reader.read_line(&mut line_buffer) => {
+            match result {
+                Ok(_) => {
+                    tracing::info!("    ⏳ >>> 已收到输入，继续操作...");
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("从stdin读取输入失败: {}", e));
+                }
+            }
+        }
     }
     
-    println!("配置完成后按 Enter 键继续连接...");
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
+    Ok(())
+}
 
+/// 连接到远程服务器并设置端口转发
+async fn connect_and_forward(args: &Args, remote_host: &str) -> Result<()> {
     // 连接操作使用新的span
     let connection_span = tracing::info_span!(
         "ssh_connection", 
-        host = %args.remote_host, 
+        host = %remote_host, 
         port = args.remote_port, 
         user = %args.user
     );
     let _connection_guard = connection_span.enter();
 
-    // Connect to remote server
+    // Connect to remote server using our SSH client
     let mut client = SshClient::new(
-        args.remote_host.clone(), 
+        remote_host.to_string(), 
         args.remote_port,
-        args.user, 
+        args.user.clone(), 
         args.key_path.clone()
     );
-    
-    tracing::info!("正在连接远程SSH服务器...");
-    client.connect().await?;
     
     // Choose a random port for the SSH server on the remote machine
     let remote_proxy_port = rand::thread_rng().gen_range(10000..65535);
     tracing::info!(port = remote_proxy_port, "在远程端口上启动SSH代理");
     
-    // Start SSH server with default credentials
-    let ssh_server = SshServer::new(
-        SshServerConfig {
-            listen_addr: args.local_host,
-            listen_port: args.local_port,
-            key_path: None, // 我们会生成一个随机密钥
-            default_username: args.server_username.clone(),
-            default_password: args.server_password.clone(),
-            sftp_root_dir: args.sftp_root_dir.clone(),
-        }
-    );
+    // 设置端口转发
+    tracing::info!("正在连接远程SSH服务器并设置端口转发...");
+    client.connect_and_forward(remote_proxy_port, args.local_host.clone(), args.local_port)
+        .await
+        .context("连接远程服务器或设置端口转发失败")?;
     
-    // Start port forwarding
-    client.forward_remote_port(remote_proxy_port, ssh_server, args.remote_host.clone()).await?;
-    
-    println!("SSH 代理正在运行。");
-    println!("使用以下命令连接到您的内部机器：");
-    println!("ssh -p {} {}@{}", remote_proxy_port, args.server_username, args.remote_host);
-    println!("默认密码: {}", args.server_password);
-    println!("\n您也可以使用动态端口转发（SOCKS5代理）：");
-    println!("ssh -p {} -D 33064 {}@{}", remote_proxy_port, args.server_username, args.remote_host);
-    println!("然后配置您的浏览器使用 SOCKS5 代理 (127.0.0.1:33064)");
-    
+    tracing::info!("");
+    tracing::info!("    🚀🌌~~~~~【 远程 SSH 代理已激活! 】~~~~~🌌🚀");
+    tracing::info!("    │");
+    tracing::info!("    │  代理目标: {}:{}", args.local_host, args.local_port);
+    tracing::info!("    │  连接命令: ssh -p {} {}@{}", remote_proxy_port, args.server_username, remote_host);
+    // 显示密码信息
+    if let Some(password) = &args.server_password {
+        tracing::info!("    │  认证信息:");
+        tracing::info!("    │    🔑 用户: [ {} ]", args.server_username);
+        tracing::info!("    │    🔒 密码: [ {} ] {}", password, 
+            if args.server_password.as_ref().unwrap() == password { "(随机生成)" } else { "" });
+    }
+    tracing::info!("    │");
+    tracing::info!("    🚀🌌~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~🌌🚀");
+
     tracing::info!(
         remote_port = remote_proxy_port,
         username = %args.server_username,
-        "SSH代理成功启动"
+        "SSH代理成功启动" // This is a more structured log, not for direct user display
     );
     
-    // Keep the connection alive
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("收到终止信号，正在关闭SSH代理...");
-    println!("正在关闭 SSH 代理...");
+    Ok(())
+}
+
+/// 显示本地SSH服务器信息
+fn show_local_server_info(args: &Args) {
+    tracing::info!("");
+    tracing::info!("    🖥️💡~~~~~【 本地 SSH 服务器待命! 】~~~~~💡🖥️");
+    tracing::info!("    │");
+    tracing::info!("    │  监听地址: {}:{}", args.local_host, args.local_port);
+    tracing::info!("    │  连接命令: ssh -p {} {}@{}", args.local_port, args.server_username, args.local_host);
+    // 显示密码信息
+    if let Some(password) = &args.server_password {
+        tracing::info!("    │  认证信息:");
+        tracing::info!("    │    🔑 用户: [ {} ]", args.server_username);
+        tracing::info!("    │    🔒 密码: [ {} ] {}", password, 
+            if args.server_password.as_ref().unwrap() == password { "(随机生成)" } else { "" });
+    }
+    tracing::info!("    │");
+    tracing::info!("    🖥️💡~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~💡🖥️");
+
+    tracing::info!(
+        local_port = args.local_port,
+        username = %args.server_username,
+        "仅本地SSH服务器模式已启动" // Structured log
+    );
+}
+
+/// 生成随机8位密码
+fn generate_random_password(length: usize) -> String {
+    // 使用字母数字和特殊字符生成随机密码
+    let mut rng = rand::thread_rng();
+    let chars: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+";
+    
+    (0..length)
+        .map(|_| {
+            let idx = rng.gen_range(0..chars.len());
+            chars[idx] as char
+        })
+        .collect()
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // 解析命令行参数
+    let mut args = Args::parse();
+    
+    // 设置日志系统
+    setup_app_logging(args.verbose);
+
+    // 输出 "Joan Stark 单鸭领航" 抬头
+    tracing::info!("");
+    tracing::info!("                 ,-.         ");
+    tracing::info!("         ,      ( {{o\\        ");
+    tracing::info!("         {{`\"=,___) (`~      ✨《《 SSH 隧道代理 v{} 》》✨", env!("CARGO_PKG_VERSION"));
+    tracing::info!("          \\  ,_.-   )");
+    tracing::info!("~^~^~^`- ~^ ~^ '~^~^~^~^~^~^~^~^~^~^~^~^~^~^~^~^~^~^~");
+    
+    // 确保有可用的密码 - 如果用户没有指定，则生成随机密码
+    if args.server_password.is_none() {
+        let random_password = generate_random_password(8);
+        args.server_password = Some(random_password);
+    }
+    
+    // 创建SSH服务器配置
+    let config = SshServerConfig {
+        listen_addr: args.local_host.clone(),
+        listen_port: args.local_port,
+        key_path: None, // 使用随机密钥
+        default_username: args.server_username.clone(),
+        default_password: args.server_password.clone().unwrap_or_default(),
+        sftp_root_dir: args.sftp_root_dir.clone(),
+    };
+    
+    // 启动SSH服务器
+    start_ssh_server(config).await;
+
+    // 只有当提供了远程主机参数时才执行远程连接和端口转发
+    if let Some(remote_host) = &args.remote_host {
+        // 准备SSH密钥
+        prepare_ssh_key(&args).await?;
+        
+        // 等待用户输入或超时
+        wait_for_user_input().await?;
+
+        // 连接远程服务器并设置端口转发
+        connect_and_forward(&args, remote_host).await?;
+    } else {
+        // 显示本地SSH服务器信息
+        show_local_server_info(&args);
+    }
+    
+    // 保持程序运行，直到收到Ctrl+C信号
+    tokio::signal::ctrl_c().await.context("等待Ctrl+C信号失败")?;
+    tracing::info!("");
+    tracing::info!("    🛑⚡~~~~~【 SSH 代理正在关闭 】~~~~~⚡🛑");
+    tracing::info!("    │         感谢使用! 再见!         │");
+    tracing::info!("    🛑⚡~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~⚡🛑");
     
     Ok(())
 }
