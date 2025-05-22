@@ -31,7 +31,7 @@
                     "kind": "bin"
                 }
             },
-            "args": ["-H","121.42.181.55"],
+            "args": [],
             "cwd": "${workspaceFolder}"
         },
         {
